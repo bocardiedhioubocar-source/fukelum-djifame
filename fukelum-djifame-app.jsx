@@ -9,22 +9,70 @@ import {
 /* =========================================================================
    FUKELUM DJIFAME — Application de gestion (Back-office atelier de couture)
    Modules : Catalogue, Clients (CRM), Stock de tissus, Commandes, Atelier,
-   Tableau de bord, Paramètres (rôles). Données partagées (window.storage).
+   Tableau de bord, Paramètres (rôles). Données synchronisées en temps réel
+   via Firestore (un document par enregistrement — voir "Couche de données").
    ========================================================================= */
 
 const ROLES = { ADMIN: "Administrateur", VENDEUSE: "Vendeuse", COUTURIERE: "Couturière" };
 const SEUIL_DEFAUT = 10;
-const STATUTS = ["En attente", "En cours", "Terminé"];
+
+// Étapes de production, dans l'ordre. "En attente" = commande créée, pas encore
+// démarrée. "Livrée" = étape finale (n'est jamais "en retard").
+const STATUTS = ["En attente", "À couper", "En couture", "Essayage", "Retouches", "Prête", "Livrée"];
+const STATUT_FINAL = "Livrée";
+const STATUT_PRET = "Prête";
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const fmtDate = (d) => (d ? new Date(d + "T00:00:00").toLocaleDateString("fr-FR", { day: "2-digit", month: "short", year: "numeric" }) : "—");
 const fmtMoney = (v) => new Intl.NumberFormat("fr-FR").format(Math.round(Number(v) || 0)) + " F";
+const fmtNumero = (n) => "CMD-" + String(n || 0).padStart(4, "0");
+
+function toneStatut(statut) {
+  if (statut === STATUT_FINAL) return "vert";
+  if (statut === STATUT_PRET) return "vert";
+  if (statut === "En attente") return "neutre";
+  return "or";
+}
+function estEnRetard(c) {
+  return !!c.dateLivraison && c.statut !== STATUT_FINAL && c.dateLivraison < todayStr();
+}
+function joursDeRetard(c) {
+  if (!estEnRetard(c)) return 0;
+  const a = new Date(c.dateLivraison + "T00:00:00");
+  const b = new Date(todayStr() + "T00:00:00");
+  return Math.max(0, Math.round((b - a) / 86400000));
+}
+function estAujourdhui(dateStr) {
+  return dateStr === todayStr();
+}
+function prochainStatut(statutActuel) {
+  const idx = STATUTS.indexOf(statutActuel);
+  return STATUTS[Math.min(idx + 1, STATUTS.length - 1)];
+}
+async function avancerStatutCommande(ops, commande) {
+  const suivant = prochainStatut(commande.statut);
+  if (suivant === commande.statut) return suivant;
+  await ops.update(commande.id, { statut: suivant, historique: [...(commande.historique || []), { statut: suivant, date: todayStr() }] });
+  return suivant;
+}
 
 const LOGO_ENSEIGNE_B64 = "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA3MDAgNDIwIiB3aWR0aD0iNzAwIiBoZWlnaHQ9IjQyMCI+CiAgPGRlZnM+CiAgICA8ZmlsdGVyIGlkPSJncmFpbiI+CiAgICAgIDxmZVR1cmJ1bGVuY2UgdHlwZT0iZnJhY3RhbE5vaXNlIiBiYXNlRnJlcXVlbmN5PSIwLjkiIG51bU9jdGF2ZXM9IjIiIHJlc3VsdD0ibiIgLz4KICAgICAgPGZlQ29sb3JNYXRyaXggaW49Im4iIHR5cGU9Im1hdHJpeCIgdmFsdWVzPSIwIDAgMCAwIDAgIDAgMCAwIDAgMCAgMCAwIDAgMCAwICAwIDAgMCAwLjAzNSAwIiAvPgogICAgPC9maWx0ZXI+CiAgPC9kZWZzPgoKICA8cmVjdCB3aWR0aD0iNzAwIiBoZWlnaHQ9IjQyMCIgZmlsbD0iIzIxMWExNCIgLz4KCiAgPGcgdHJhbnNmb3JtPSJyb3RhdGUoLTEuMiAzNTAgMjEwKSI+CiAgICA8IS0tIHBsYW5jaGUgcGVpbnRlIDoga2FvbGluIC8gdGVycmUgLS0+CiAgICA8cmVjdCB4PSIzMCIgeT0iMzAiIHdpZHRoPSI2NDAiIGhlaWdodD0iMzYwIiByeD0iMTQiIGZpbGw9IiNFREUzRDAiIHN0cm9rZT0iIzJBMUYxNiIgc3Ryb2tlLXdpZHRoPSIxMCIgLz4KICAgIDxyZWN0IHg9IjQ0IiB5PSI0NCIgd2lkdGg9IjYxMiIgaGVpZ2h0PSIzMzIiIHJ4PSI4IiBmaWxsPSJub25lIiBzdHJva2U9IiNCNTY1MUQiIHN0cm9rZS13aWR0aD0iNCIgLz4KICAgIDxyZWN0IHg9IjU0IiB5PSI1NCIgd2lkdGg9IjU5MiIgaGVpZ2h0PSIzMTIiIHJ4PSI2IiBmaWxsPSJub25lIiBzdHJva2U9IiNDOUExNUEiIHN0cm9rZS13aWR0aD0iMiIgLz4KCgogICAgPCEtLSBGVUtFTFVNIDogb21icmUgb2NyZS9sYXTDqXJpdGUgKyBsZXR0cmUgbm9pcmUgLS0+CiAgICA8dGV4dCB4PSIzNTQiIHk9IjE5NiIgZm9udC1mYW1pbHk9IkFyaWFsIEJsYWNrLCBBcmlhbCwgc2Fucy1zZXJpZiIgZm9udC13ZWlnaHQ9IjkwMCIgZm9udC1zaXplPSI5MiIKICAgICAgICAgIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZpbGw9IiNCNTY1MUQiPkZVS0VMVU08L3RleHQ+CiAgICA8dGV4dCB4PSIzNTAiIHk9IjE5MiIgZm9udC1mYW1pbHk9IkFyaWFsIEJsYWNrLCBBcmlhbCwgc2Fucy1zZXJpZiIgZm9udC13ZWlnaHQ9IjkwMCIgZm9udC1zaXplPSI5MiIKICAgICAgICAgIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZpbGw9IiMyQTFGMTYiPkZVS0VMVU08L3RleHQ+CgogICAgPCEtLSBESklGQU1FIDogb21icmUgbm9pcmUgKyBsZXR0cmUgb2NyZSAtLT4KICAgIDx0ZXh0IHg9IjM1NCIgeT0iMjgyIiBmb250LWZhbWlseT0iQXJpYWwgQmxhY2ssIEFyaWFsLCBzYW5zLXNlcmlmIiBmb250LXdlaWdodD0iOTAwIiBmb250LXNpemU9IjgwIgogICAgICAgICAgdGV4dC1hbmNob3I9Im1pZGRsZSIgZmlsbD0iIzJBMUYxNiI+REpJRkFNRTwvdGV4dD4KICAgIDx0ZXh0IHg9IjM1MCIgeT0iMjc4IiBmb250LWZhbWlseT0iQXJpYWwgQmxhY2ssIEFyaWFsLCBzYW5zLXNlcmlmIiBmb250LXdlaWdodD0iOTAwIiBmb250LXNpemU9IjgwIgogICAgICAgICAgdGV4dC1hbmNob3I9Im1pZGRsZSIgZmlsbD0iI0M2ODQxRiIgc3Ryb2tlPSIjMkExRjE2IiBzdHJva2Utd2lkdGg9IjEuNSI+REpJRkFNRTwvdGV4dD4KCiAgICA8bGluZSB4MT0iMTQwIiB5MT0iMzA4IiB4Mj0iNTYwIiB5Mj0iMzA4IiBzdHJva2U9IiNCNTY1MUQiIHN0cm9rZS13aWR0aD0iMyIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiAvPgoKICAgIDx0ZXh0IHg9IjM1MCIgeT0iMzM2IiBmb250LWZhbWlseT0iR2VvcmdpYSwgc2VyaWYiIGZvbnQtc2l6ZT0iMjAiIGxldHRlci1zcGFjaW5nPSI0IgogICAgICAgICAgdGV4dC1hbmNob3I9Im1pZGRsZSIgZmlsbD0iI0I1NjUxRCIgZm9udC1zdHlsZT0iaXRhbGljIj5NYWlzb24gZGUgQ291dHVyZTwvdGV4dD4KICAgIDx0ZXh0IHg9IjM1MCIgeT0iMzU4IiBmb250LWZhbWlseT0iR2VvcmdpYSwgc2VyaWYiIGZvbnQtc2l6ZT0iMTMiIGxldHRlci1zcGFjaW5nPSI1IgogICAgICAgICAgdGV4dC1hbmNob3I9Im1pZGRsZSIgZmlsbD0iIzJBMUYxNiI+REFLQVIgwrcgU8OJTsOJR0FMPC90ZXh0PgogIDwvZz4KCiAgPHJlY3Qgd2lkdGg9IjcwMCIgaGVpZ2h0PSI0MjAiIGZpbHRlcj0idXJsKCNncmFpbikiIC8+Cjwvc3ZnPgo=";
 const LOGO_ENSEIGNE_DATA_URI = "data:image/svg+xml;base64," + LOGO_ENSEIGNE_B64;
 
-const STORAGE_KEYS = {
+/* --------------------------- Couche de données ---------------------------
+   Chaque collection (catalogue, clients, stock, commandes, encaissements,
+   employes) est stockée en un document Firestore PAR enregistrement, avec
+   synchronisation temps réel (onSnapshot). C'est ce qui permet des mises à
+   jour concurrentes fiables (ex. deux ventes sur le même tissu en même
+   temps) — contrairement à l'ancienne version où chaque collection était un
+   unique document JSON, réécrit en entier à chaque modification.
+
+   Ancien format (fdj_data/fdj-*, un blob JSON par collection) conservé en
+   lecture seule uniquement pour la migration automatique au premier
+   chargement — voir migrerOuInitialiserDonnees(). Il n'est plus jamais écrit. */
+
+const ANCIENNES_CLES = {
   catalogue: "fdj-catalogue",
   clients: "fdj-clients",
   stock: "fdj-stock",
@@ -42,12 +90,236 @@ async function loadKey(key, fallback) {
     return fallback;
   }
 }
-async function saveKey(key, value) {
-  try {
-    await window.storage.set(key, JSON.stringify(value), true);
-  } catch (e) {
-    console.error("Erreur de sauvegarde", key, e);
+
+function fdjDb() {
+  return typeof window !== "undefined" ? window.__fdjDb : undefined;
+}
+
+// Stores de repli en mémoire — utilisés uniquement quand Firestore est
+// indisponible (tests locaux, mode dégradé hors-ligne). Non partagés entre
+// appareils, contrairement aux collections Firestore.
+const memoryStores = {};
+function memoryStore(name) {
+  if (!memoryStores[name]) memoryStores[name] = { items: [], listeners: [] };
+  return memoryStores[name];
+}
+
+function makeCollectionStore(name) {
+  const db = fdjDb();
+  if (db) {
+    const col = db.collection(name);
+    return {
+      subscribe(cb) {
+        return col.onSnapshot(
+          (snap) => cb(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+          (err) => {
+            console.error(`Firestore(${name}) — erreur de synchronisation :`, err);
+            window.__fdjCloudConnected = false;
+          }
+        );
+      },
+      async add(item) {
+        const id = item.id || uid();
+        await col.doc(id).set({ ...item, id });
+        return id;
+      },
+      async update(id, patch) { await col.doc(id).set(patch, { merge: true }); },
+      async remove(id) { await col.doc(id).delete(); },
+    };
   }
+  // Repli local (mémoire du navigateur, non partagé).
+  const store = memoryStore(name);
+  function emit() { store.listeners.forEach((l) => l(store.items.slice())); }
+  return {
+    subscribe(cb) {
+      store.listeners.push(cb);
+      emit();
+      return () => { store.listeners = store.listeners.filter((l) => l !== cb); };
+    },
+    async add(item) {
+      const id = item.id || uid();
+      store.items = [...store.items, { ...item, id }];
+      emit();
+      return id;
+    },
+    async update(id, patch) {
+      store.items = store.items.map((x) => (x.id === id ? { ...x, ...patch } : x));
+      emit();
+    },
+    async remove(id) {
+      store.items = store.items.filter((x) => x.id !== id);
+      emit();
+    },
+  };
+}
+
+// Migration (une seule fois, verrouillée par transaction) : reprend les
+// anciens blobs s'ils existent, sinon amorce les données d'exemple — jamais
+// les deux, pour ne pas faire croire à une migration déjà faite alors que ce
+// n'est qu'un jeu d'exemple qui vient d'être créé.
+async function migrerOuInitialiserDonnees() {
+  const db = fdjDb();
+  const seeds = {
+    catalogue: SEED_CATALOGUE, clients: SEED_CLIENTS, stock: SEED_STOCK,
+    commandes: [], encaissements: [], employes: SEED_EMPLOYES,
+  };
+
+  if (!db) {
+    for (const [collection, seed] of Object.entries(seeds)) {
+      const store = memoryStore(collection);
+      if (store.items.length === 0 && seed.length > 0) store.items = seed.map((it) => ({ ...it }));
+    }
+    return;
+  }
+
+  const metaRef = db.collection("fdj_meta").doc("migration");
+  let doitTraiter = false;
+  try {
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(metaRef);
+      if (snap.exists) return;
+      doitTraiter = true;
+      tx.set(metaRef, { status: "en-cours", startedAt: Date.now() });
+    });
+  } catch (e) {
+    console.error("Initialisation des données — verrou indisponible :", e);
+    return;
+  }
+  if (!doitTraiter) return;
+
+  try {
+    let elementsMigres = 0;
+    for (const [collection, ancienneCle] of Object.entries(ANCIENNES_CLES)) {
+      const snapshotActuel = await db.collection(collection).limit(1).get();
+      if (!snapshotActuel.empty) continue; // déjà des données ici, on ne touche à rien
+      const ancien = await loadKey(ancienneCle, null);
+      const batch = db.batch();
+      if (Array.isArray(ancien) && ancien.length > 0) {
+        ancien.forEach((item) => {
+          const id = item.id || uid();
+          batch.set(db.collection(collection).doc(id), { ...item, id });
+        });
+        elementsMigres += ancien.length;
+      } else if (seeds[collection].length > 0) {
+        seeds[collection].forEach((item) => batch.set(db.collection(collection).doc(item.id), item));
+      } else {
+        continue;
+      }
+      await batch.commit();
+    }
+    const commandesSnap = await db.collection("commandes").get();
+    if (commandesSnap.size > 0) {
+      await db.collection("compteurs").doc("commandes").set({ suivant: commandesSnap.size + 1 }, { merge: true });
+    }
+    await metaRef.set({ status: "termine", finishedAt: Date.now(), elements: elementsMigres }, { merge: true });
+    if (elementsMigres > 0) console.log(`Migration Firestore terminée — ${elementsMigres} éléments repris de l'ancien format.`);
+  } catch (e) {
+    console.error("Initialisation des données — erreur, nouvelle tentative au prochain chargement :", e);
+    await metaRef.delete().catch(() => {});
+  }
+}
+
+// Création atomique d'une commande : vérifie et déduit le stock, attribue un
+// numéro de commande séquentiel, dans une seule transaction Firestore. Deux
+// ventes simultanées sur le même tissu ne peuvent plus s'écraser l'une
+// l'autre (contrairement à l'ancienne version, où tout le stock était réécrit
+// en bloc à chaque commande).
+async function creerCommandeAtomique(payload) {
+  const { tissuId, quantiteTissu, avance, ...reste } = payload;
+  const qte = Number(quantiteTissu) || 0;
+  const db = fdjDb();
+  const id = uid();
+
+  if (db) {
+    const compteurRef = db.collection("compteurs").doc("commandes");
+    const stockRef = tissuId ? db.collection("stock").doc(tissuId) : null;
+    const commandeRef = db.collection("commandes").doc(id);
+    const numero = await db.runTransaction(async (tx) => {
+      const compteurSnap = await tx.get(compteurRef);
+      const suivant = compteurSnap.exists ? Number(compteurSnap.data().suivant) || 1 : 1;
+      if (stockRef) {
+        const stockSnap = await tx.get(stockRef);
+        if (!stockSnap.exists) throw new Error("Ce tissu n'existe plus — il a peut-être été supprimé entre-temps.");
+        const dispo = Number(stockSnap.data().metrage) || 0;
+        if (qte > dispo) throw new Error(`Stock insuffisant : ${dispo} m disponibles, ${qte} m demandés.`);
+        tx.update(stockRef, { metrage: dispo - qte });
+      }
+      tx.set(commandeRef, {
+        ...reste, id, tissuId: tissuId || "", quantiteTissu: qte, avance: Number(avance) || 0,
+        numero: suivant, statut: STATUTS[0], dateCreation: todayStr(), historique: [{ statut: STATUTS[0], date: todayStr() }],
+      });
+      tx.set(compteurRef, { suivant: suivant + 1 }, { merge: true });
+      if (Number(avance) > 0) {
+        tx.set(db.collection("encaissements").doc(uid()), {
+          id, commandeId: id, montant: Number(avance), type: "Acompte", date: todayStr(),
+        });
+      }
+      return suivant;
+    });
+    return { id, numero };
+  }
+
+  // Repli local (pas de vraie concurrence à gérer hors Firestore).
+  const stockStore = memoryStore("stock");
+  if (tissuId) {
+    const t = stockStore.items.find((x) => x.id === tissuId);
+    if (!t) throw new Error("Ce tissu n'existe plus.");
+    const dispo = Number(t.metrage) || 0;
+    if (qte > dispo) throw new Error(`Stock insuffisant : ${dispo} m disponibles, ${qte} m demandés.`);
+    stockStore.items = stockStore.items.map((x) => (x.id === tissuId ? { ...x, metrage: dispo - qte } : x));
+    stockStore.listeners.forEach((l) => l(stockStore.items.slice()));
+  }
+  const commandeStore = memoryStore("commandes");
+  const numero = commandeStore.items.length + 1;
+  const commande = {
+    ...reste, id, tissuId: tissuId || "", quantiteTissu: qte, avance: Number(avance) || 0,
+    numero, statut: STATUTS[0], dateCreation: todayStr(), historique: [{ statut: STATUTS[0], date: todayStr() }],
+  };
+  commandeStore.items = [...commandeStore.items, commande];
+  commandeStore.listeners.forEach((l) => l(commandeStore.items.slice()));
+  if (Number(avance) > 0) {
+    const encStore = memoryStore("encaissements");
+    encStore.items = [...encStore.items, { id: uid(), commandeId: id, montant: Number(avance), type: "Acompte", date: todayStr() }];
+    encStore.listeners.forEach((l) => l(encStore.items.slice()));
+  }
+  return { id, numero };
+}
+
+// Encaissement d'un paiement : met à jour la commande et ajoute la ligne
+// d'historique dans la même transaction.
+async function encaisserPaiementAtomique(commandeId, montant, type) {
+  const montantNum = Number(montant) || 0;
+  const db = fdjDb();
+
+  if (db) {
+    const commandeRef = db.collection("commandes").doc(commandeId);
+    const encRef = db.collection("encaissements").doc(uid());
+    return db.runTransaction(async (tx) => {
+      const snap = await tx.get(commandeRef);
+      if (!snap.exists) throw new Error("Commande introuvable.");
+      const c = snap.data();
+      const reste = Number(c.resteAPayer) || 0;
+      const verse = Math.max(0, Math.min(montantNum, reste));
+      tx.update(commandeRef, { avance: (Number(c.avance) || 0) + verse, resteAPayer: reste - verse });
+      tx.set(encRef, { id: encRef.id, commandeId, montant: verse, type: type || "Paiement", date: todayStr() });
+      return verse;
+    });
+  }
+
+  const commandeStore = memoryStore("commandes");
+  const c = commandeStore.items.find((x) => x.id === commandeId);
+  if (!c) throw new Error("Commande introuvable.");
+  const reste = Number(c.resteAPayer) || 0;
+  const verse = Math.max(0, Math.min(montantNum, reste));
+  commandeStore.items = commandeStore.items.map((x) =>
+    x.id === commandeId ? { ...x, avance: (Number(x.avance) || 0) + verse, resteAPayer: reste - verse } : x
+  );
+  commandeStore.listeners.forEach((l) => l(commandeStore.items.slice()));
+  const encStore = memoryStore("encaissements");
+  const enc = { id: uid(), commandeId, montant: verse, type: type || "Paiement", date: todayStr() };
+  encStore.items = [...encStore.items, enc];
+  encStore.listeners.forEach((l) => l(encStore.items.slice()));
+  return verse;
 }
 
 const SEED_CATALOGUE = [
@@ -128,9 +400,9 @@ function TextArea(props) {
   return <textarea {...props} style={{ ...inputStyle, fontFamily: "var(--font-body)", ...(props.style || {}) }} className={"outline-none focus:ring-2 " + (props.className || "")} />;
 }
 
-function Card({ children, className = "", style = {}, hover = false }) {
+function Card({ children, className = "", style = {}, hover = false, ...rest }) {
   return (
-    <div className={"rounded-lg fdj-card " + (hover ? "fdj-card-hover " : "") + className} style={{ background: "#fff", border: "1px solid var(--ligne)", ...style }}>
+    <div className={"rounded-lg fdj-card " + (hover ? "fdj-card-hover " : "") + className} style={{ background: "#fff", border: "1px solid var(--ligne)", ...style }} {...rest}>
       {children}
     </div>
   );
@@ -195,57 +467,49 @@ export default function App() {
     setAuthUser(null); // pas d'authentification disponible (ex. environnement sans Firebase) : accès libre non applicable ici
   }, []);
 
+  // Un store par collection (add/update/remove + abonnement temps réel). Créés
+  // une seule fois pour toute la durée de vie du composant.
+  const stores = useMemo(() => ({
+    catalogue: makeCollectionStore("catalogue"),
+    clients: makeCollectionStore("clients"),
+    stock: makeCollectionStore("stock"),
+    commandes: makeCollectionStore("commandes"),
+    encaissements: makeCollectionStore("encaissements"),
+    employes: makeCollectionStore("employes"),
+  }), []);
+
   useEffect(() => {
     let cancelled = false;
-    const seeds = {
-      catalogue: SEED_CATALOGUE, clients: SEED_CLIENTS, stock: SEED_STOCK,
-      commandes: [], encaissements: [], employes: SEED_EMPLOYES,
-    };
-    const autoSeed = { catalogue: true, clients: true, stock: true, commandes: false, encaissements: false, employes: true };
+    let unsubs = [];
     const setters = {
       catalogue: setCatalogue, clients: setClients, stock: setStock,
       commandes: setCommandes, encaissements: setEncaissements, employes: setEmployes,
     };
-    const names = Object.keys(STORAGE_KEYS);
-
-    if (window.storage && typeof window.storage.subscribe === "function") {
-      // Mode temps réel (base partagée type Firestore) : chaque changement, local ou distant, met à jour l'écran.
+    (async () => {
+      await migrerOuInitialiserDonnees();
+      if (cancelled) return;
+      const names = Object.keys(stores);
       let pending = names.length;
-      const unsubs = names.map((name) =>
-        window.storage.subscribe(STORAGE_KEYS[name], (raw) => {
-          if (raw == null) {
-            setters[name](seeds[name]);
-            if (autoSeed[name]) saveKey(STORAGE_KEYS[name], seeds[name]);
-          } else {
-            try { setters[name](JSON.parse(raw)); } catch (e) { setters[name](seeds[name]); }
-          }
+      unsubs = names.map((name) =>
+        stores[name].subscribe((items) => {
+          setters[name](items);
           if (pending > 0) { pending--; if (pending === 0 && !cancelled) setLoading(false); }
         })
       );
-      return () => { cancelled = true; unsubs.forEach((u) => u && u()); };
-    }
-
-    // Mode chargement unique (ex. environnement Claude, sans synchronisation temps réel)
-    (async () => {
-      const results = await Promise.all(names.map((name) => loadKey(STORAGE_KEYS[name], null)));
-      names.forEach((name, i) => {
-        const v = results[i];
-        setters[name](v ?? seeds[name]);
-        if (v == null && autoSeed[name]) saveKey(STORAGE_KEYS[name], seeds[name]);
-      });
-      if (!cancelled) setLoading(false);
     })();
-    return () => { cancelled = true; };
-  }, []);
+    return () => { cancelled = true; unsubs.forEach((u) => u && u()); };
+  }, [stores]); // eslint-disable-line
 
-  const persist = {
-    catalogue: (v) => { setCatalogue(v); saveKey(STORAGE_KEYS.catalogue, v); },
-    clients: (v) => { setClients(v); saveKey(STORAGE_KEYS.clients, v); },
-    stock: (v) => { setStock(v); saveKey(STORAGE_KEYS.stock, v); },
-    commandes: (v) => { setCommandes(v); saveKey(STORAGE_KEYS.commandes, v); },
-    encaissements: (v) => { setEncaissements(v); saveKey(STORAGE_KEYS.encaissements, v); },
-    employes: (v) => { setEmployes(v); saveKey(STORAGE_KEYS.employes, v); },
-  };
+  async function reinitialiserDonneesDemo() {
+    await Promise.all(commandes.map((c) => stores.commandes.remove(c.id)));
+    await Promise.all(encaissements.map((e) => stores.encaissements.remove(e.id)));
+    await Promise.all(catalogue.map((m) => stores.catalogue.remove(m.id)));
+    await Promise.all(clients.map((c) => stores.clients.remove(c.id)));
+    await Promise.all(stock.map((t) => stores.stock.remove(t.id)));
+    await Promise.all(SEED_CATALOGUE.map((item) => stores.catalogue.add(item)));
+    await Promise.all(SEED_CLIENTS.map((item) => stores.clients.add(item)));
+    await Promise.all(SEED_STOCK.map((item) => stores.stock.add(item)));
+  }
 
   if (loading || authUser === undefined) {
     return (
@@ -302,39 +566,34 @@ export default function App() {
           {tab === "dashboard" && (
             <Dashboard
               session={session} commandes={commandes} catalogue={catalogue} clients={clients}
-              stock={stock} encaissements={encaissements} setCommandes={persist.commandes} setTab={setTab}
+              stock={stock} encaissements={encaissements} setTab={setTab}
             />
           )}
           {tab === "catalogue" && (
-            <Catalogue catalogue={catalogue} setCatalogue={persist.catalogue} readOnly={session.role !== ROLES.ADMIN} />
+            <Catalogue catalogue={catalogue} ops={stores.catalogue} readOnly={session.role !== ROLES.ADMIN} />
           )}
           {tab === "clients" && (
-            <Clients clients={clients} setClients={persist.clients} commandes={commandes} catalogue={catalogue} />
+            <Clients clients={clients} ops={stores.clients} commandes={commandes} catalogue={catalogue} />
           )}
           {tab === "stock" && (
-            <Stock stock={stock} setStock={persist.stock} />
+            <Stock stock={stock} ops={stores.stock} />
           )}
           {tab === "commandes" && (
             <Commandes
-              session={session} commandes={commandes} setCommandes={persist.commandes}
-              clients={clients} setClients={persist.clients} catalogue={catalogue}
-              stock={stock} setStock={persist.stock}
-              encaissements={encaissements} setEncaissements={persist.encaissements}
+              session={session} commandes={commandes} commandesOps={stores.commandes}
+              clients={clients} clientsOps={stores.clients} catalogue={catalogue}
+              stock={stock} encaissements={encaissements}
             />
           )}
           {tab === "atelier" && (
-            <Atelier commandes={commandes} setCommandes={persist.commandes} catalogue={catalogue} clients={clients} />
+            <Atelier commandes={commandes} commandesOps={stores.commandes} catalogue={catalogue} clients={clients} />
           )}
           {tab === "parametres" && (
             <Parametres
-              employes={employes} setEmployes={persist.employes}
+              employes={employes} ops={stores.employes}
               onReset={async () => {
-                if (!confirm("Réinitialiser toutes les données de démonstration ? Cette action est irréversible.")) return;
-                persist.catalogue(SEED_CATALOGUE);
-                persist.clients(SEED_CLIENTS);
-                persist.stock(SEED_STOCK);
-                persist.commandes([]);
-                persist.encaissements([]);
+                if (!confirm("Réinitialiser toutes les données de démonstration ? Cette action est irréversible : commandes, clients, catalogue et stock actuels seront supprimés.")) return;
+                await reinitialiserDonneesDemo();
               }}
             />
           )}
@@ -586,30 +845,109 @@ function Sidebar({ nav, tab, setTab, session, onLogout, mobileOpen, onCloseMobil
 
 /* ------------------------------- Dashboard ------------------------------- */
 
-function Dashboard({ session, commandes, catalogue, clients, stock, encaissements, setCommandes, setTab }) {
-  const today = todayStr();
-  const caJour = encaissements.filter((e) => e.date === today).reduce((s, e) => s + Number(e.montant || 0), 0);
-  const counts = STATUTS.reduce((acc, s) => ({ ...acc, [s]: commandes.filter((c) => c.statut === s).length }), {});
-  const critiques = stock.filter((t) => Number(t.metrage) < Number(t.seuil || SEUIL_DEFAUT));
-  const [filtre, setFiltre] = useState("Tous");
-  const isAdmin = session.role === ROLES.ADMIN;
+function ligneATraiter(c, client, modele, kind) {
+  const infos = {
+    retard: { icon: "🔴", label: `En retard (${joursDeRetard(c)} j)` },
+    livraison: { icon: "🔴", label: "Livraison aujourd'hui" },
+    essayage: { icon: "🟠", label: "Essayage prévu" },
+    prete: { icon: "🟢", label: "Prête à livrer" },
+  }[kind];
+  return { commande: c, client, modele, kind, ...infos };
+}
 
-  const liste = commandes
-    .filter((c) => filtre === "Tous" || c.statut === filtre)
-    .slice()
-    .sort((a, b) => (a.dateLivraison || "").localeCompare(b.dateLivraison || ""));
+function Dashboard({ session, commandes, catalogue, clients, stock, encaissements, setTab }) {
+  const today = todayStr();
+  const isAdmin = session.role === ROLES.ADMIN;
+  const moisCourant = today.slice(0, 7); // "YYYY-MM"
+
+  const caJour = encaissements.filter((e) => e.date === today).reduce((s, e) => s + Number(e.montant || 0), 0);
+  const caMois = encaissements.filter((e) => (e.date || "").startsWith(moisCourant)).reduce((s, e) => s + Number(e.montant || 0), 0);
+  const commandesMois = commandes.filter((c) => (c.dateCreation || "").startsWith(moisCourant));
+  const panierMoyen = commandesMois.length > 0 ? commandesMois.reduce((s, c) => s + Number(c.prixTotal || 0), 0) / commandesMois.length : 0;
+
+  const enProduction = commandes.filter((c) => c.statut !== "En attente" && c.statut !== STATUT_FINAL && c.statut !== STATUT_PRET).length;
+  const pretes = commandes.filter((c) => c.statut === STATUT_PRET).length;
+  const critiques = stock.filter((t) => Number(t.metrage) < Number(t.seuil || SEUIL_DEFAUT));
+
+  function trouver(c) {
+    return { client: clients.find((x) => x.id === c.clientId), modele: catalogue.find((x) => x.id === c.modeleId) };
+  }
+
+  // "À faire aujourd'hui" : une commande peut apparaître dans plusieurs catégories
+  // (ex. en retard ET impayée) — chaque ligne est une action concrète à traiter.
+  const aTraiter = [];
+  commandes.forEach((c) => {
+    if (c.statut === STATUT_FINAL) return;
+    const { client, modele } = trouver(c);
+    if (estEnRetard(c)) aTraiter.push(ligneATraiter(c, client, modele, "retard"));
+    else if (estAujourdhui(c.dateLivraison)) aTraiter.push(ligneATraiter(c, client, modele, "livraison"));
+    else if (c.statut === "Essayage") aTraiter.push(ligneATraiter(c, client, modele, "essayage"));
+    else if (c.statut === STATUT_PRET) aTraiter.push(ligneATraiter(c, client, modele, "prete"));
+  });
+  const ordreKind = { retard: 0, livraison: 1, essayage: 2, prete: 3 };
+  aTraiter.sort((a, b) => ordreKind[a.kind] - ordreKind[b.kind]);
+
+  const impayees = isAdmin ? commandes.filter((c) => c.statut !== STATUT_FINAL && Number(c.resteAPayer) > 0).slice(0, 5) : [];
 
   return (
     <div>
-      <Header title="Tableau de bord" sub={`Bonjour ${session.nom}, voici l'activité de l'atelier.`} />
+      <Header title="Tableau de bord" sub={`Bonjour ${session.nom} — aujourd'hui, ${fmtDate(today)}.`} />
 
-      <div className="grid gap-4 mb-6" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(190px,1fr))" }}>
-        {isAdmin && <StatCard icon={Wallet} label="Chiffre d'affaires du jour" value={fmtMoney(caJour)} tone="or" />}
-        <StatCard icon={ClipboardList} label="En attente" value={counts["En attente"] || 0} tone="neutre" />
-        <StatCard icon={Scissors} label="En cours" value={counts["En cours"] || 0} tone="neutre" />
-        <StatCard icon={Check} label="Terminées" value={counts["Terminé"] || 0} tone="vert" />
-        {isAdmin && <StatCard icon={AlertTriangle} label="Tissus en alerte" value={critiques.length} tone={critiques.length ? "rouge" : "neutre"} />}
+      <div className="grid gap-4 mb-6" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(170px,1fr))" }}>
+        {isAdmin && <StatCard icon={Wallet} label="CA du jour" value={fmtMoney(caJour)} tone="or" />}
+        {isAdmin && <StatCard icon={Wallet} label="CA du mois" value={fmtMoney(caMois)} tone="or" />}
+        <StatCard icon={ShoppingBag} label="Commandes ce mois-ci" value={commandesMois.length} tone="neutre" />
+        {isAdmin && <StatCard icon={Banknote} label="Panier moyen" value={fmtMoney(panierMoyen)} tone="neutre" />}
+        <StatCard icon={Scissors} label="En production" value={enProduction} tone="neutre" />
+        <StatCard icon={Check} label="Prêtes à livrer" value={pretes} tone="vert" />
       </div>
+
+      {/* À faire aujourd'hui */}
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-semibold" style={{ fontFamily: "var(--font-display)", fontSize: "18px" }}>À faire aujourd'hui</h3>
+      </div>
+      <Card className="mb-6">
+        {aTraiter.length === 0 ? (
+          <EmptyState icon={Check} title="Rien d'urgent" sub="Aucune livraison, retard ou essayage à traiter aujourd'hui." />
+        ) : (
+          <div>
+            {aTraiter.map((l, i) => (
+              <button
+                key={l.commande.id + l.label} onClick={() => setTab("commandes")}
+                className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left"
+                style={{ borderBottom: i < aTraiter.length - 1 ? "1px solid var(--ligne)" : "none" }}
+              >
+                <span className="flex items-center gap-2 min-w-0">
+                  <span>{l.icon}</span>
+                  <span className="truncate">
+                    <strong>{l.client ? `${l.client.prenom} ${l.client.nom}` : "Client"}</strong> — {l.modele?.nom || "Modèle"}
+                    <span className="block text-xs" style={{ color: "var(--gris-fonce)" }}>{l.label} · {fmtNumero(l.commande.numero)}</span>
+                  </span>
+                </span>
+                <ChevronRight size={16} style={{ color: "var(--gris-fonce)", flexShrink: 0 }} />
+              </button>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {isAdmin && impayees.length > 0 && (
+        <>
+          <h3 className="font-semibold mb-3" style={{ fontFamily: "var(--font-display)", fontSize: "18px" }}>Paiements en attente</h3>
+          <Card className="mb-6">
+            {impayees.map((c, i) => {
+              const { client } = trouver(c);
+              return (
+                <button key={c.id} onClick={() => setTab("commandes")} className="w-full flex items-center justify-between px-4 py-3 text-left"
+                  style={{ borderBottom: i < impayees.length - 1 ? "1px solid var(--ligne)" : "none" }}>
+                  <span>{client ? `${client.prenom} ${client.nom}` : "Client"} · {fmtNumero(c.numero)}</span>
+                  <span style={{ fontFamily: "var(--font-mono)", color: "var(--bordeaux)", fontWeight: 600 }}>{fmtMoney(c.resteAPayer)}</span>
+                </button>
+              );
+            })}
+          </Card>
+        </>
+      )}
 
       {isAdmin && critiques.length > 0 && (
         <Card className="p-4 mb-6" style={{ borderColor: "var(--bordeaux)" }}>
@@ -624,47 +962,7 @@ function Dashboard({ session, commandes, catalogue, clients, stock, encaissement
         </Card>
       )}
 
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="font-semibold" style={{ fontFamily: "var(--font-display)", fontSize: "18px" }}>Commandes</h3>
-        <div className="flex gap-1">
-          {["Tous", ...STATUTS].map((s) => (
-            <button key={s} onClick={() => setFiltre(s)} className="px-3 py-1.5 rounded-full text-xs font-medium"
-              style={{ background: filtre === s ? "var(--noir)" : "var(--gris-clair)", color: filtre === s ? "var(--creme)" : "var(--noir)" }}>
-              {s}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <Card className="overflow-x-auto">
-        {liste.length === 0 ? (
-          <EmptyState icon={ShoppingBag} title="Aucune commande" sub="Les commandes créées apparaîtront ici, filtrables par statut." />
-        ) : (
-          <table>
-            <thead><tr><th>Client</th><th>Genre</th><th>Modèle</th><th>Livraison</th><th>Reste à payer</th><th>Statut</th></tr></thead>
-            <tbody>
-              {liste.map((c) => {
-                const client = clients.find((x) => x.id === c.clientId);
-                const modele = catalogue.find((x) => x.id === c.modeleId);
-                return (
-                  <tr key={c.id}>
-                    <td>{client ? `${client.prenom} ${client.nom}` : "—"}</td>
-                    <td>{c.genre || "—"}</td>
-                    <td>{modele?.nom || "—"}</td>
-                    <td>{fmtDate(c.dateLivraison)}</td>
-                    <td style={{ fontFamily: "var(--font-mono)" }}>{fmtMoney(c.resteAPayer)}</td>
-                    <td><StatutBadge statut={c.statut} /></td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </Card>
-
-      <div className="mt-6">
-        <Btn variant="or" onClick={() => setTab("commandes")}><Plus size={15} /> Nouvelle commande</Btn>
-      </div>
+      <Btn variant="or" onClick={() => setTab("commandes")}><Plus size={15} /> Nouvelle commande</Btn>
     </div>
   );
 }
@@ -681,8 +979,7 @@ function StatCard({ icon: Icon, label, value, tone }) {
 }
 
 function StatutBadge({ statut }) {
-  const tone = statut === "Terminé" ? "vert" : statut === "En cours" ? "or" : "neutre";
-  return <Badge tone={tone}>{statut}</Badge>;
+  return <Badge tone={toneStatut(statut)}>{statut}</Badge>;
 }
 
 function Header({ title, sub, action }) {
@@ -699,7 +996,7 @@ function Header({ title, sub, action }) {
 
 /* ------------------------------- Catalogue -------------------------------- */
 
-function Catalogue({ catalogue, setCatalogue, readOnly }) {
+function Catalogue({ catalogue, ops, readOnly }) {
   const [editing, setEditing] = useState(null); // model or {} for new
   const [q, setQ] = useState("");
   const [viewPhoto, setViewPhoto] = useState(null);
@@ -707,16 +1004,13 @@ function Catalogue({ catalogue, setCatalogue, readOnly }) {
   const filtered = catalogue.filter((m) => (m.nom + m.categorie).toLowerCase().includes(q.toLowerCase()));
 
   function save(model) {
-    if (model.id) {
-      setCatalogue(catalogue.map((m) => (m.id === model.id ? model : m)));
-    } else {
-      setCatalogue([...catalogue, { ...model, id: uid() }]);
-    }
+    if (model.id) ops.update(model.id, model);
+    else ops.add({ ...model, id: uid() });
     setEditing(null);
     toastFdj("Modèle enregistré ✓");
   }
   function remove(id) {
-    if (confirm("Supprimer ce modèle du catalogue ?")) setCatalogue(catalogue.filter((m) => m.id !== id));
+    if (confirm("Supprimer ce modèle du catalogue ?")) ops.remove(id);
   }
 
   return (
@@ -935,7 +1229,7 @@ function ModeleForm({ model, onCancel, onSave }) {
 
 /* -------------------------------- Clients --------------------------------- */
 
-function Clients({ clients, setClients, commandes, catalogue }) {
+function Clients({ clients, ops, commandes, catalogue }) {
   const [editing, setEditing] = useState(null);
   const [detail, setDetail] = useState(null);
   const [q, setQ] = useState("");
@@ -943,13 +1237,13 @@ function Clients({ clients, setClients, commandes, catalogue }) {
   const filtered = clients.filter((c) => (c.nom + c.prenom + c.telephone).toLowerCase().includes(q.toLowerCase()));
 
   function save(client) {
-    if (client.id) setClients(clients.map((c) => (c.id === client.id ? client : c)));
-    else setClients([...clients, { ...client, id: uid(), dateCreation: todayStr() }]);
+    if (client.id) ops.update(client.id, client);
+    else ops.add({ ...client, id: uid(), dateCreation: todayStr() });
     setEditing(null);
     toastFdj("Client enregistré ✓");
   }
   function remove(id) {
-    if (confirm("Supprimer cette fiche client ?")) setClients(clients.filter((c) => c.id !== id));
+    if (confirm("Supprimer cette fiche client ?")) ops.remove(id);
   }
 
   return (
@@ -1052,17 +1346,17 @@ function ClientForm({ client, onCancel, onSave }) {
 
 /* --------------------------------- Stock ---------------------------------- */
 
-function Stock({ stock, setStock }) {
+function Stock({ stock, ops }) {
   const [editing, setEditing] = useState(null);
 
   function save(t) {
-    if (t.id) setStock(stock.map((x) => (x.id === t.id ? t : x)));
-    else setStock([...stock, { ...t, id: uid() }]);
+    if (t.id) ops.update(t.id, t);
+    else ops.add({ ...t, id: uid() });
     setEditing(null);
     toastFdj("Tissu enregistré ✓");
   }
   function remove(id) {
-    if (confirm("Supprimer ce tissu du stock ?")) setStock(stock.filter((x) => x.id !== id));
+    if (confirm("Supprimer ce tissu du stock ?")) ops.remove(id);
   }
 
   return (
@@ -1286,33 +1580,74 @@ function ficheRemplie(commande, client, modele) {
   `;
 }
 
-function Commandes({ session, commandes, setCommandes, clients, setClients, catalogue, stock, setStock, encaissements, setEncaissements }) {
+const FILTRES_COMMANDES = ["Toutes", "En retard", ...STATUTS, "Impayées"];
+
+function CommandeCard({ commande: c, client, modele, onOpen }) {
+  const retard = estEnRetard(c);
+  return (
+    <Card className="overflow-hidden cursor-pointer" hover onClick={() => onOpen(c)}>
+      <div className="flex gap-3 p-3">
+        <div className="shrink-0 rounded-md overflow-hidden flex items-center justify-center" style={{ width: "56px", height: "56px", background: "var(--gris-clair)" }}>
+          {modele?.photoUrl ? (
+            <img src={modele.photoUrl} alt="" className="w-full h-full object-cover" onError={(e) => { e.currentTarget.style.display = "none"; }} />
+          ) : (
+            <ImageOff size={16} style={{ color: "var(--gris-fonce)" }} />
+          )}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-semibold" style={{ fontFamily: "var(--font-mono)", color: "var(--gris-fonce)" }}>{fmtNumero(c.numero)}</p>
+            <StatutBadge statut={c.statut} />
+          </div>
+          <p className="font-medium truncate" style={{ fontSize: "14px" }}>{client ? `${client.prenom} ${client.nom}` : "Client supprimé"}</p>
+          <p className="text-xs truncate" style={{ color: "var(--gris-fonce)" }}>{modele?.nom || "Modèle supprimé"}</p>
+        </div>
+      </div>
+      <div className="px-3 pb-3 flex items-center justify-between text-xs" style={{ color: "var(--gris-fonce)" }}>
+        <span className="flex items-center gap-1">
+          {retard ? (
+            <Badge tone="rouge">Retard {joursDeRetard(c)} j</Badge>
+          ) : (
+            <><Calendar size={12} /> {fmtDate(c.dateLivraison)}</>
+          )}
+        </span>
+        <span style={{ fontFamily: "var(--font-mono)" }}>
+          {c.resteAPayer > 0 ? <span style={{ color: "var(--bordeaux)", fontWeight: 600 }}>Reste {fmtMoney(c.resteAPayer)}</span> : <span style={{ color: "var(--sauge-txt)" }}>Payé ✓</span>}
+        </span>
+      </div>
+    </Card>
+  );
+}
+
+function Commandes({ session, commandes, commandesOps, clients, clientsOps, catalogue, stock, encaissements }) {
   const [showForm, setShowForm] = useState(false);
-  const [pay, setPay] = useState(null);
+  const [filtre, setFiltre] = useState("Toutes");
+  const [q, setQ] = useState("");
+  const [detail, setDetail] = useState(null);
   const isAdmin = session.role === ROLES.ADMIN;
 
-  function creerCommande(payload) {
-    const { tissuId, quantiteTissu, avance } = payload;
-    if (tissuId) {
-      setStock(stock.map((t) => (t.id === tissuId ? { ...t, metrage: Math.max(0, Number(t.metrage) - Number(quantiteTissu || 0)) } : t)));
-    }
-    const commande = { ...payload, id: uid(), statut: "En attente", dateCreation: todayStr() };
-    setCommandes([commande, ...commandes]);
-    if (Number(avance) > 0) {
-      setEncaissements([...encaissements, { id: uid(), commandeId: commande.id, montant: Number(avance), type: "Acompte", date: todayStr() }]);
-    }
+  async function creerCommande(payload) {
+    await creerCommandeAtomique(payload);
     setShowForm(false);
     toastFdj("Commande créée ✓");
   }
 
-  function encaisser(commandeId, montant) {
-    const c = commandes.find((x) => x.id === commandeId);
-    const montantVerse = Math.min(Number(montant), c.resteAPayer);
-    setCommandes(commandes.map((x) => (x.id === commandeId ? { ...x, avance: Number(x.avance) + montantVerse, resteAPayer: x.resteAPayer - montantVerse } : x)));
-    setEncaissements([...encaissements, { id: uid(), commandeId, montant: montantVerse, type: "Solde", date: todayStr() }]);
-    setPay(null);
-    toastFdj("Paiement encaissé ✓");
-  }
+  const filtered = commandes
+    .filter((c) => {
+      if (filtre === "En retard") return estEnRetard(c);
+      if (filtre === "Impayées") return Number(c.resteAPayer) > 0;
+      if (filtre !== "Toutes") return c.statut === filtre;
+      return true;
+    })
+    .filter((c) => {
+      if (!q.trim()) return true;
+      const client = clients.find((x) => x.id === c.clientId);
+      const modele = catalogue.find((x) => x.id === c.modeleId);
+      const hay = `${fmtNumero(c.numero)} ${client ? client.prenom + " " + client.nom : ""} ${modele?.nom || ""}`.toLowerCase();
+      return hay.includes(q.trim().toLowerCase());
+    })
+    .slice()
+    .sort((a, b) => (b.numero || 0) - (a.numero || 0));
 
   return (
     <div>
@@ -1328,56 +1663,52 @@ function Commandes({ session, commandes, setCommandes, clients, setClients, cata
         </Btn>
       </div>
 
-      <Card className="overflow-x-auto">
-        {commandes.length === 0 ? (
-          <EmptyState icon={ShoppingBag} title="Aucune commande enregistrée" sub="Créez votre première commande à partir du bouton ci-dessus." />
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Client</th><th>Genre</th><th>Modèle</th><th>Livraison</th>
-                {isAdmin && <th>Prix total</th>}
-                <th>Reste à payer</th><th>Statut</th><th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {commandes.map((c) => {
-                const client = clients.find((x) => x.id === c.clientId);
-                const modele = catalogue.find((x) => x.id === c.modeleId);
-                return (
-                  <tr key={c.id}>
-                    <td>{client ? `${client.prenom} ${client.nom}` : "—"}</td>
-                    <td>{c.genre || "—"}</td>
-                    <td>{modele?.nom || "—"}</td>
-                    <td>{fmtDate(c.dateLivraison)}</td>
-                    {isAdmin && <td style={{ fontFamily: "var(--font-mono)" }}>{fmtMoney(c.prixTotal)}</td>}
-                    <td style={{ fontFamily: "var(--font-mono)" }}>{fmtMoney(c.resteAPayer)}</td>
-                    <td><StatutBadge statut={c.statut} /></td>
-                    <td>
-                      <div className="flex gap-1">
-                        {c.resteAPayer > 0 && (
-                          <Btn variant="ghost" style={{ padding: "4px 8px", fontSize: "12px" }} onClick={() => setPay(c)}><Banknote size={12} /> Encaisser</Btn>
-                        )}
-                        <Btn variant="ghost" style={{ padding: "4px 8px", fontSize: "12px" }} onClick={() => imprimerFiche(`Fiche client — ${client ? client.prenom + " " + client.nom : ""}`, ficheRemplie(c, client, modele))}>
-                          <ClipboardList size={12} /> Imprimer
-                        </Btn>
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </Card>
+      <div className="mb-3 flex items-center gap-2 max-w-sm">
+        <Search size={15} style={{ color: "var(--gris-fonce)" }} />
+        <Input placeholder="Rechercher : client, n° commande, modèle…" value={q} onChange={(e) => setQ(e.target.value)} />
+      </div>
+
+      <div className="flex flex-wrap gap-1.5 mb-4">
+        {FILTRES_COMMANDES.map((f) => (
+          <button key={f} onClick={() => setFiltre(f)} className="px-3 py-1.5 rounded-full text-xs font-medium"
+            style={{ background: filtre === f ? "var(--noir)" : "var(--gris-clair)", color: filtre === f ? "var(--creme)" : "var(--noir)" }}>
+            {f}
+          </button>
+        ))}
+      </div>
+
+      {filtered.length === 0 ? (
+        <EmptyState icon={ShoppingBag} title="Aucune commande" sub="Aucune commande ne correspond à ce filtre — créez-en une, ou changez de filtre." />
+      ) : (
+        <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(260px,1fr))" }}>
+          {filtered.map((c) => (
+            <CommandeCard
+              key={c.id} commande={c}
+              client={clients.find((x) => x.id === c.clientId)}
+              modele={catalogue.find((x) => x.id === c.modeleId)}
+              onOpen={setDetail}
+            />
+          ))}
+        </div>
+      )}
 
       {showForm && (
         <NouvelleCommandeForm
           onCancel={() => setShowForm(false)} onSave={creerCommande}
-          clients={clients} setClients={setClients} catalogue={catalogue} stock={stock} isAdmin={isAdmin}
+          clients={clients} clientsOps={clientsOps} catalogue={catalogue} stock={stock} isAdmin={isAdmin}
         />
       )}
-      {pay && <EncaisserForm commande={pay} onCancel={() => setPay(null)} onConfirm={(m) => encaisser(pay.id, m)} />}
+      {detail && (
+        <FicheCommande
+          commande={commandes.find((x) => x.id === detail.id) || detail}
+          client={clients.find((x) => x.id === detail.clientId)}
+          modele={catalogue.find((x) => x.id === detail.modeleId)}
+          tissu={stock.find((x) => x.id === detail.tissuId)}
+          paiements={encaissements.filter((e) => e.commandeId === detail.id)}
+          commandesOps={commandesOps} isAdmin={isAdmin}
+          onClose={() => setDetail(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1396,7 +1727,189 @@ function EncaisserForm({ commande, onCancel, onConfirm }) {
   );
 }
 
-function NouvelleCommandeForm({ onCancel, onSave, clients, setClients, catalogue, stock, isAdmin }) {
+/* ---------------------------- Fiche commande ----------------------------
+   Le dossier complet d'une commande : client, modèle/tissu, mesures,
+   workflow de production, finances (historique des paiements) et notes.
+   ------------------------------------------------------------------------ */
+
+function FicheCommande({ commande: c, client, modele, tissu, paiements, commandesOps, isAdmin, onClose }) {
+  const [pay, setPay] = useState(false);
+  const [enCours, setEnCours] = useState(false);
+  const [notes, setNotes] = useState(c.notes || "");
+
+  const listeGenre = MESURES[c.genre] || MESURES.Femme;
+  const mesuresRenseignees = [...listeGenre.core, ...listeGenre.extra].filter((m) => c.mesures?.[m.key]);
+  const retard = estEnRetard(c);
+  const idxStatut = STATUTS.indexOf(c.statut);
+  const dernier = c.statut === STATUT_FINAL;
+
+  async function avancer() {
+    setEnCours(true);
+    try { await avancerStatutCommande(commandesOps, c); toastFdj("Étape suivante ✓"); }
+    finally { setEnCours(false); }
+  }
+
+  async function encaisser(montant) {
+    await encaisserPaiementAtomique(c.id, montant, "Paiement");
+    setPay(false);
+    toastFdj("Paiement encaissé ✓");
+  }
+
+  function enregistrerNotes() {
+    if (notes !== (c.notes || "")) commandesOps.update(c.id, { notes });
+  }
+
+  return (
+    <Modal title={`${fmtNumero(c.numero)} — ${client ? client.prenom + " " + client.nom : "Client supprimé"}`} onClose={onClose} wide>
+      <div className="flex items-center gap-2 mb-4 flex-wrap">
+        <StatutBadge statut={c.statut} />
+        {retard && <Badge tone="rouge">En retard de {joursDeRetard(c)} j</Badge>}
+        <span className="text-xs" style={{ color: "var(--gris-fonce)" }}>Créée le {fmtDate(c.dateCreation)}</span>
+      </div>
+
+      <div className="flex gap-3 mb-4">
+        {modele?.photoUrl ? (
+          <img src={modele.photoUrl} alt="" className="rounded-md" style={{ width: "72px", height: "72px", objectFit: "cover" }} />
+        ) : (
+          <div className="rounded-md flex items-center justify-center" style={{ width: "72px", height: "72px", background: "var(--gris-clair)" }}>
+            <ImageOff size={20} style={{ color: "var(--gris-fonce)" }} />
+          </div>
+        )}
+        <div>
+          <p className="font-semibold" style={{ fontFamily: "var(--font-display)", fontSize: "17px" }}>{modele?.nom || "Modèle supprimé"}</p>
+          <p className="text-sm" style={{ color: "var(--gris-fonce)" }}>{c.genre} · Livraison souhaitée {fmtDate(c.dateLivraison)}</p>
+          {client?.telephone && <p className="text-sm flex items-center gap-1 mt-1"><Phone size={12} style={{ color: "var(--or)" }} /> {client.telephone}</p>}
+        </div>
+      </div>
+
+      <Ruban />
+
+      {/* Workflow de production */}
+      <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>Production</p>
+      <div className="flex items-center gap-1 mb-3 overflow-x-auto" style={{ paddingBottom: "2px" }}>
+        {STATUTS.map((s, i) => (
+          <React.Fragment key={s}>
+            <span className="text-xs px-2 py-1 rounded-full whitespace-nowrap" style={{
+              background: i <= idxStatut ? "var(--or)" : "var(--gris-clair)",
+              color: i <= idxStatut ? "#fff" : "var(--gris-fonce)",
+              fontWeight: i === idxStatut ? 700 : 500,
+            }}>
+              {s}
+            </span>
+            {i < STATUTS.length - 1 && <div style={{ width: "10px", height: "1px", background: "var(--ligne)", flexShrink: 0 }} />}
+          </React.Fragment>
+        ))}
+      </div>
+      {!dernier && (
+        <Btn variant="or" style={{ padding: "6px 14px" }} disabled={enCours} onClick={avancer}>
+          {enCours ? <Loader2 size={13} className="animate-spin" /> : <Check size={14} />} Faire passer à « {prochainStatut(c.statut)} »
+        </Btn>
+      )}
+
+      <Ruban />
+
+      {/* Mesures */}
+      <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>Mesures</p>
+      {mesuresRenseignees.length === 0 ? (
+        <p className="text-sm mb-1" style={{ color: "var(--gris-fonce)" }}>Aucune mesure enregistrée.</p>
+      ) : (
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-3 gap-y-1 text-sm mb-1" style={{ fontFamily: "var(--font-mono)" }}>
+          {mesuresRenseignees.map((m) => (
+            <span key={m.key}>{m.label.replace(" (cm)", "")} : <strong>{c.mesures[m.key]}</strong> cm</span>
+          ))}
+        </div>
+      )}
+
+      <Ruban />
+
+      {/* Tissu */}
+      <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>Tissu</p>
+      <p className="text-sm mb-1">
+        {tissu ? `${tissu.nom} — ${tissu.couleur}` : "Tissu supprimé"} · <strong style={{ fontFamily: "var(--font-mono)" }}>{c.quantiteTissu} m</strong> utilisés
+      </p>
+
+      <Ruban />
+
+      {/* Finances */}
+      <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>Finances</p>
+      <div className="grid sm:grid-cols-3 gap-3 mb-3">
+        {isAdmin && (
+          <Card className="p-3"><p className="text-xs" style={{ color: "var(--gris-fonce)" }}>Prix total</p><p style={{ fontFamily: "var(--font-mono)", fontWeight: 700 }}>{fmtMoney(c.prixTotal)}</p></Card>
+        )}
+        <Card className="p-3"><p className="text-xs" style={{ color: "var(--gris-fonce)" }}>Payé</p><p style={{ fontFamily: "var(--font-mono)", fontWeight: 700, color: "var(--sauge-txt)" }}>{fmtMoney(c.avance)}</p></Card>
+        <Card className="p-3" style={{ background: c.resteAPayer > 0 ? "#f2dede" : undefined }}>
+          <p className="text-xs" style={{ color: "var(--gris-fonce)" }}>Reste à payer</p>
+          <p style={{ fontFamily: "var(--font-mono)", fontWeight: 700, color: c.resteAPayer > 0 ? "var(--bordeaux)" : "var(--noir)" }}>{fmtMoney(c.resteAPayer)}</p>
+        </Card>
+      </div>
+
+      {paiements.length > 0 && (
+        <div className="flex flex-col gap-1 mb-3">
+          {paiements.slice().sort((a, b) => (a.date || "").localeCompare(b.date || "")).map((p) => (
+            <div key={p.id} className="flex items-center justify-between text-sm px-3 py-1.5 rounded-md" style={{ background: "var(--gris-clair)" }}>
+              <span>{fmtDate(p.date)} — {p.type}</span>
+              <span style={{ fontFamily: "var(--font-mono)", fontWeight: 600 }}>{fmtMoney(p.montant)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {c.resteAPayer > 0 && (
+        <Btn variant="or" style={{ padding: "6px 14px" }} onClick={() => setPay(true)}><Banknote size={14} /> Encaisser un paiement</Btn>
+      )}
+
+      <Ruban />
+
+      {/* Notes */}
+      <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>Notes</p>
+      <TextArea rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} onBlur={enregistrerNotes} placeholder="Remarques particulières sur cette commande…" />
+
+      <div className="flex justify-between gap-2 mt-5">
+        <Btn variant="ghost" onClick={() => imprimerFiche(`Fiche client — ${client ? client.prenom + " " + client.nom : ""}`, ficheRemplie(c, client, modele))}>
+          <ClipboardList size={14} /> Imprimer la fiche
+        </Btn>
+        <Btn variant="ghost" onClick={onClose}>Fermer</Btn>
+      </div>
+
+      {pay && <EncaisserForm commande={c} onCancel={() => setPay(false)} onConfirm={encaisser} />}
+    </Modal>
+  );
+}
+
+const ETAPES_COMMANDE = [
+  { n: 1, label: "Client" },
+  { n: 2, label: "Modèle & tissu" },
+  { n: 3, label: "Mesures" },
+  { n: 4, label: "Livraison & prix" },
+];
+
+function EtapesIndicateur({ etape }) {
+  return (
+    <div className="flex items-center gap-1 mb-5">
+      {ETAPES_COMMANDE.map((e, i) => (
+        <React.Fragment key={e.n}>
+          <div className="flex items-center gap-1.5">
+            <span
+              className="flex items-center justify-center rounded-full text-xs font-semibold"
+              style={{
+                width: "22px", height: "22px",
+                background: e.n <= etape ? "var(--or)" : "var(--gris-clair)",
+                color: e.n <= etape ? "#fff" : "var(--gris-fonce)",
+              }}
+            >
+              {e.n < etape ? <Check size={12} /> : e.n}
+            </span>
+            <span className="text-xs font-medium hidden sm:inline" style={{ color: e.n === etape ? "var(--noir)" : "var(--gris-fonce)" }}>{e.label}</span>
+          </div>
+          {i < ETAPES_COMMANDE.length - 1 && <div style={{ flex: 1, height: "1px", background: "var(--ligne)" }} />}
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+function NouvelleCommandeForm({ onCancel, onSave, clients, clientsOps, catalogue, stock, isAdmin }) {
+  const [etape, setEtape] = useState(1);
   const [clientId, setClientId] = useState("");
   const [clientQ, setClientQ] = useState("");
   const [showNewClient, setShowNewClient] = useState(false);
@@ -1409,6 +1922,9 @@ function NouvelleCommandeForm({ onCancel, onSave, clients, setClients, catalogue
   const [dateLivraison, setDateLivraison] = useState("");
   const [prixTotal, setPrixTotal] = useState("");
   const [avance, setAvance] = useState("");
+  const [notes, setNotes] = useState("");
+  const [enregistrement, setEnregistrement] = useState(false);
+  const [erreur, setErreur] = useState("");
 
   const modele = catalogue.find((m) => m.id === modeleId);
   const tissu = stock.find((t) => t.id === tissuId);
@@ -1421,134 +1937,186 @@ function NouvelleCommandeForm({ onCancel, onSave, clients, setClients, catalogue
   const depasseStock = tissu && Number(quantiteTissu) > Number(tissu.metrage);
   const fichesMesures = MESURES[genre] || MESURES.Femme;
 
-  const peutValider = clientId && modeleId && tissuId && quantiteTissu && genre && dateLivraison && prixTotal && !depasseStock;
+  const etape1Ok = !!clientId;
+  const etape2Ok = !!(modeleId && tissuId && quantiteTissu && !depasseStock);
+  const etape3Ok = !!genre;
+  const peutValider = etape1Ok && etape2Ok && etape3Ok && dateLivraison && prixTotal;
 
   function changerGenre(g) {
     setGenre(g);
     setMesures({});
   }
 
-  function ajouterClientRapide(c) {
+  async function ajouterClientRapide(c) {
     const nouveau = { ...c, id: uid(), dateCreation: todayStr() };
-    setClients([...clients, nouveau]);
+    await clientsOps.add(nouveau);
     setClientId(nouveau.id);
     setGenre(nouveau.genre || "Femme");
     setShowNewClient(false);
   }
 
-  function valider() {
-    onSave({
-      clientId, modeleId, tissuId, quantiteTissu: Number(quantiteTissu), genre, mesures,
-      dateLivraison, prixTotal: Number(prixTotal), avance: Number(avance || 0), resteAPayer: reste,
-    });
+  async function valider() {
+    setErreur("");
+    setEnregistrement(true);
+    try {
+      await onSave({
+        clientId, modeleId, tissuId, quantiteTissu: Number(quantiteTissu), genre, mesures, notes,
+        dateLivraison, prixTotal: Number(prixTotal), avance: Number(avance || 0), resteAPayer: reste,
+      });
+    } catch (e) {
+      setErreur(e.message || "Une erreur est survenue — la commande n'a pas été créée.");
+      setEnregistrement(false);
+    }
   }
+
+  function suivant() { setEtape((e) => Math.min(4, e + 1)); }
+  function precedent() { setEtape((e) => Math.max(1, e - 1)); }
 
   return (
     <Modal title="Nouvelle commande" onClose={onCancel} wide>
-      {/* 1. Client */}
-      <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>1 · Client</p>
-      {!clientId ? (
+      <EtapesIndicateur etape={etape} />
+
+      {etape === 1 && (
         <div>
-          <Input placeholder="Rechercher un client…" value={clientQ} onChange={(e) => setClientQ(e.target.value)} />
-          <div className="max-h-32 overflow-y-auto mt-2 flex flex-col gap-1">
-            {clientsFiltres.slice(0, 6).map((c) => (
-              <button key={c.id} onClick={() => setClientId(c.id)} className="text-left text-sm px-3 py-2 rounded-md" style={{ background: "var(--gris-clair)" }}>
-                {c.prenom} {c.nom} {c.telephone && `· ${c.telephone}`}
-              </button>
-            ))}
-          </div>
-          <button className="text-xs mt-2 font-semibold" style={{ color: "var(--or)" }} onClick={() => setShowNewClient(true)}>+ Nouveau client</button>
-        </div>
-      ) : (
-        <div className="flex items-center justify-between px-3 py-2 rounded-md" style={{ background: "var(--gris-clair)" }}>
-          <span className="text-sm font-medium">{clients.find((c) => c.id === clientId)?.prenom} {clients.find((c) => c.id === clientId)?.nom}</span>
-          <button className="text-xs" style={{ color: "var(--bordeaux)" }} onClick={() => setClientId("")}>Changer</button>
-        </div>
-      )}
-      {showNewClient && <InlineClientForm onCancel={() => setShowNewClient(false)} onSave={ajouterClientRapide} />}
-
-      <Ruban />
-      {/* 2. Modèle */}
-      <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>2 · Modèle</p>
-      <Select value={modeleId} onChange={(e) => setModeleId(e.target.value)}>
-        <option value="">— Sélectionner un modèle —</option>
-        {catalogue.map((m) => <option key={m.id} value={m.id}>{m.nom} ({m.categorie || "sans catégorie"})</option>)}
-      </Select>
-      {modele && <p className="text-sm mt-2">Prix de vente : <strong style={{ fontFamily: "var(--font-mono)" }}>{fmtMoney(modele.prix)}</strong></p>}
-
-      <Ruban />
-      {/* 3. Tissu */}
-      <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>3 · Tissu (déduit du stock)</p>
-      <div className="grid sm:grid-cols-2 gap-x-3">
-        <Select value={tissuId} onChange={(e) => setTissuId(e.target.value)}>
-          <option value="">— Sélectionner un tissu —</option>
-          {stock.map((t) => <option key={t.id} value={t.id}>{t.nom} — {t.couleur}{isAdmin ? ` (${t.metrage} m dispo.)` : ""}</option>)}
-        </Select>
-        <Input type="number" placeholder="Quantité utilisée (m)" value={quantiteTissu} onChange={(e) => setQuantiteTissu(e.target.value)} />
-      </div>
-      {depasseStock && (
-        <p className="text-xs mt-2 flex items-center gap-1" style={{ color: "var(--bordeaux)" }}>
-          <AlertTriangle size={12} /> Quantité supérieure au stock disponible ({tissu.metrage} m).
-        </p>
-      )}
-
-      <Ruban />
-      {/* 4. Mesures */}
-      <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>4 · Prise de mesures</p>
-
-      <Field label="Genre du client" hint="La vendeuse choisit ici la fiche de mesures à utiliser (peut différer de la fiche client).">
-        <div className="flex gap-2">
-          {["Femme", "Homme"].map((g) => (
-            <button key={g} type="button" onClick={() => changerGenre(g)}
-              className="flex-1 rounded-md text-sm font-medium" style={{ padding: "8px 10px", border: "1px solid var(--ligne)", background: genre === g ? "var(--noir)" : "#fff", color: genre === g ? "var(--creme)" : "var(--noir)" }}>
-              {g}
-            </button>
-          ))}
-        </div>
-      </Field>
-
-      {genre && (
-        <>
-          <div className="grid sm:grid-cols-2 gap-x-3">
-            {fichesMesures.core.map((m) => (
-              <Field key={m.key} label={m.label}>
-                <Input type="number" value={mesures[m.key] || ""} onChange={(e) => setMesures({ ...mesures, [m.key]: e.target.value })} />
-              </Field>
-            ))}
-          </div>
-          <button className="text-xs font-semibold mb-2" style={{ color: "var(--or)" }} onClick={() => setSpecifiquesOuvert(!specifiquesOuvert)}>
-            {specifiquesOuvert ? "− Masquer" : "+ Ajouter"} les mesures complémentaires ({genre.toLowerCase()}, selon le modèle)
-          </button>
-          {specifiquesOuvert && (
-            <div className="grid sm:grid-cols-2 gap-x-3 p-3 rounded-md mb-2" style={{ background: "var(--gris-clair)" }}>
-              {fichesMesures.extra.map((m) => (
-                <Field key={m.key} label={m.label}>
-                  <Input type="number" value={mesures[m.key] || ""} onChange={(e) => setMesures({ ...mesures, [m.key]: e.target.value })} />
-                </Field>
-              ))}
+          <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>Client</p>
+          {!clientId ? (
+            <div>
+              <Input placeholder="Rechercher un client…" value={clientQ} onChange={(e) => setClientQ(e.target.value)} />
+              <div className="max-h-40 overflow-y-auto mt-2 flex flex-col gap-1">
+                {clientsFiltres.slice(0, 8).map((c) => (
+                  <button key={c.id} onClick={() => setClientId(c.id)} className="text-left text-sm px-3 py-2 rounded-md" style={{ background: "var(--gris-clair)" }}>
+                    {c.prenom} {c.nom} {c.telephone && `· ${c.telephone}`}
+                  </button>
+                ))}
+                {clientsFiltres.length === 0 && <p className="text-xs px-1" style={{ color: "var(--gris-fonce)" }}>Aucun client trouvé.</p>}
+              </div>
+              <button className="text-xs mt-2 font-semibold" style={{ color: "var(--or)" }} onClick={() => setShowNewClient(true)}>+ Nouveau client</button>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between px-3 py-2 rounded-md" style={{ background: "var(--gris-clair)" }}>
+              <span className="text-sm font-medium">{client?.prenom} {client?.nom}</span>
+              <button className="text-xs" style={{ color: "var(--bordeaux)" }} onClick={() => setClientId("")}>Changer</button>
             </div>
           )}
-        </>
+          {showNewClient && <InlineClientForm onCancel={() => setShowNewClient(false)} onSave={ajouterClientRapide} />}
+        </div>
       )}
 
-      <Ruban />
-      {/* Livraison */}
-      <Field label="Date de livraison souhaitée"><Input type="date" value={dateLivraison} onChange={(e) => setDateLivraison(e.target.value)} /></Field>
+      {etape === 2 && (
+        <div>
+          <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>Modèle</p>
+          <Select value={modeleId} onChange={(e) => setModeleId(e.target.value)}>
+            <option value="">— Sélectionner un modèle —</option>
+            {catalogue.map((m) => <option key={m.id} value={m.id}>{m.nom} ({m.categorie || "sans catégorie"})</option>)}
+          </Select>
+          {modele && (
+            <div className="flex items-center gap-3 mt-2">
+              {modele.photoUrl ? (
+                <img src={modele.photoUrl} alt="" className="rounded-md" style={{ width: "52px", height: "52px", objectFit: "cover" }} />
+              ) : (
+                <div className="rounded-md flex items-center justify-center" style={{ width: "52px", height: "52px", background: "var(--gris-clair)" }}>
+                  <ImageOff size={16} style={{ color: "var(--gris-fonce)" }} />
+                </div>
+              )}
+              <p className="text-sm">Prix de vente : <strong style={{ fontFamily: "var(--font-mono)" }}>{fmtMoney(modele.prix)}</strong></p>
+            </div>
+          )}
 
-      <Ruban />
-      {/* 5. Finances */}
-      <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>5 · Finances</p>
-      <div className="grid sm:grid-cols-3 gap-x-3">
-        <Field label="Prix total">
-          <Input type="number" value={prixTotal} onChange={(e) => setPrixTotal(e.target.value)} disabled={!isAdmin} />
-        </Field>
-        <Field label="Acompte versé"><Input type="number" value={avance} onChange={(e) => setAvance(e.target.value)} /></Field>
-        <Field label="Reste à payer"><Input value={fmtMoney(reste)} disabled style={{ fontWeight: 600 }} /></Field>
-      </div>
+          <Ruban />
+          <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>Tissu (déduit du stock)</p>
+          <div className="grid sm:grid-cols-2 gap-x-3">
+            <Select value={tissuId} onChange={(e) => setTissuId(e.target.value)}>
+              <option value="">— Sélectionner un tissu —</option>
+              {stock.map((t) => <option key={t.id} value={t.id}>{t.nom} — {t.couleur} ({t.metrage} m dispo.)</option>)}
+            </Select>
+            <Input type="number" placeholder="Quantité utilisée (m)" value={quantiteTissu} onChange={(e) => setQuantiteTissu(e.target.value)} />
+          </div>
+          {depasseStock && (
+            <p className="text-xs mt-2 flex items-center gap-1" style={{ color: "var(--bordeaux)" }}>
+              <AlertTriangle size={12} /> Quantité supérieure au stock disponible ({tissu.metrage} m).
+            </p>
+          )}
+        </div>
+      )}
 
-      <div className="flex justify-end gap-2 mt-5">
-        <Btn variant="ghost" onClick={onCancel}>Annuler</Btn>
-        <Btn variant="or" disabled={!peutValider} onClick={valider}>Valider la commande</Btn>
+      {etape === 3 && (
+        <div>
+          <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>Prise de mesures</p>
+          <Field label="Genre du client" hint="Détermine la fiche de mesures utilisée (peut différer de la fiche client).">
+            <div className="flex gap-2">
+              {["Femme", "Homme"].map((g) => (
+                <button key={g} type="button" onClick={() => changerGenre(g)}
+                  className="flex-1 rounded-md text-sm font-medium" style={{ padding: "8px 10px", border: "1px solid var(--ligne)", background: genre === g ? "var(--noir)" : "#fff", color: genre === g ? "var(--creme)" : "var(--noir)" }}>
+                  {g}
+                </button>
+              ))}
+            </div>
+          </Field>
+
+          {genre && (
+            <>
+              <div className="grid sm:grid-cols-2 gap-x-3">
+                {fichesMesures.core.map((m) => (
+                  <Field key={m.key} label={m.label}>
+                    <Input type="number" value={mesures[m.key] || ""} onChange={(e) => setMesures({ ...mesures, [m.key]: e.target.value })} />
+                  </Field>
+                ))}
+              </div>
+              <button className="text-xs font-semibold mb-2" style={{ color: "var(--or)" }} onClick={() => setSpecifiquesOuvert(!specifiquesOuvert)}>
+                {specifiquesOuvert ? "− Masquer" : "+ Ajouter"} les mesures complémentaires ({genre.toLowerCase()}, selon le modèle)
+              </button>
+              {specifiquesOuvert && (
+                <div className="grid sm:grid-cols-2 gap-x-3 p-3 rounded-md mb-2" style={{ background: "var(--gris-clair)" }}>
+                  {fichesMesures.extra.map((m) => (
+                    <Field key={m.key} label={m.label}>
+                      <Input type="number" value={mesures[m.key] || ""} onChange={(e) => setMesures({ ...mesures, [m.key]: e.target.value })} />
+                    </Field>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {etape === 4 && (
+        <div>
+          <Field label="Date de livraison souhaitée"><Input type="date" value={dateLivraison} onChange={(e) => setDateLivraison(e.target.value)} /></Field>
+
+          <Ruban />
+          <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>Finances</p>
+          <div className="grid sm:grid-cols-3 gap-x-3">
+            <Field label="Prix total">
+              <Input type="number" value={prixTotal} onChange={(e) => setPrixTotal(e.target.value)} disabled={!isAdmin} />
+            </Field>
+            <Field label="Acompte versé"><Input type="number" value={avance} onChange={(e) => setAvance(e.target.value)} /></Field>
+            <Field label="Reste à payer"><Input value={fmtMoney(reste)} disabled style={{ fontWeight: 600 }} /></Field>
+          </div>
+
+          <Field label="Notes (facultatif)"><TextArea rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} /></Field>
+
+          {erreur && (
+            <p className="text-xs mb-2 flex items-center gap-1" style={{ color: "var(--bordeaux)" }}>
+              <AlertTriangle size={12} /> {erreur}
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="flex justify-between gap-2 mt-5">
+        <div>{etape > 1 && <Btn variant="ghost" onClick={precedent}>Précédent</Btn>}</div>
+        <div className="flex gap-2">
+          <Btn variant="ghost" onClick={onCancel}>Annuler</Btn>
+          {etape < 4 ? (
+            <Btn variant="or" disabled={(etape === 1 && !etape1Ok) || (etape === 2 && !etape2Ok) || (etape === 3 && !etape3Ok)} onClick={suivant}>
+              Suivant
+            </Btn>
+          ) : (
+            <Btn variant="or" disabled={!peutValider || enregistrement} onClick={valider}>
+              {enregistrement ? <Loader2 size={14} className="animate-spin" /> : "Créer la commande"}
+            </Btn>
+          )}
+        </div>
       </div>
     </Modal>
   );
@@ -1584,20 +2152,17 @@ function InlineClientForm({ onCancel, onSave }) {
 
 /* --------------------------------- Atelier -------------------------------- */
 
-function Atelier({ commandes, setCommandes, catalogue, clients }) {
+function Atelier({ commandes, commandesOps, catalogue, clients }) {
   const [filtre, setFiltre] = useState("Actives");
-  const liste = commandes.filter((c) => (filtre === "Actives" ? c.statut !== "Terminé" : true));
 
-  function avancerStatut(id) {
-    let nouveauStatut = "";
-    setCommandes(commandes.map((c) => {
-      if (c.id !== id) return c;
-      const idx = STATUTS.indexOf(c.statut);
-      const suivant = STATUTS[Math.min(idx + 1, STATUTS.length - 1)];
-      nouveauStatut = suivant;
-      return { ...c, statut: suivant };
-    }));
-    setTimeout(() => toastFdj(nouveauStatut === "Terminé" ? "Commande terminée ✓" : "Commande mise à jour ✓"), 0);
+  const liste = commandes
+    .filter((c) => (filtre === "Actives" ? c.statut !== STATUT_FINAL : true))
+    .slice()
+    .sort((a, b) => (estEnRetard(b) ? 1 : 0) - (estEnRetard(a) ? 1 : 0) || (a.dateLivraison || "").localeCompare(b.dateLivraison || ""));
+
+  async function avancerStatut(c) {
+    const suivant = await avancerStatutCommande(commandesOps, c);
+    toastFdj(suivant === STATUT_FINAL ? "Commande livrée ✓" : "Commande passée à « " + suivant + " » ✓");
   }
 
   return (
@@ -1621,29 +2186,36 @@ function Atelier({ commandes, setCommandes, catalogue, clients }) {
             const client = clients.find((x) => x.id === c.clientId);
             const listeGenre = MESURES[c.genre] || MESURES.Femme;
             const toutesMesures = [...listeGenre.core, ...listeGenre.extra].filter((m) => c.mesures?.[m.key]);
+            const retard = estEnRetard(c);
             return (
-              <Card key={c.id} className="overflow-hidden">
-                <div className="h-32 flex items-center justify-center" style={{ background: "var(--gris-clair)" }}>
+              <Card key={c.id} className="overflow-hidden" style={retard ? { borderColor: "var(--bordeaux)" } : undefined}>
+                <div className="h-32 flex items-center justify-center relative" style={{ background: "var(--gris-clair)" }}>
                   {modele?.photoUrl ? (
                     <img src={modele.photoUrl} alt={modele.nom} className="w-full h-full object-cover" onError={(e) => { e.currentTarget.style.display = "none"; }} />
                   ) : (
                     <ImageOff size={20} style={{ color: "var(--gris-fonce)" }} />
                   )}
+                  {retard && (
+                    <span className="absolute" style={{ top: "8px", left: "8px" }}>
+                      <Badge tone="rouge">Retard {joursDeRetard(c)} j</Badge>
+                    </span>
+                  )}
                 </div>
                 <div className="p-4">
                   <div className="flex items-center justify-between mb-1">
-                    <p className="font-semibold" style={{ fontFamily: "var(--font-display)", fontSize: "15px" }}>{modele?.nom || "Modèle"}</p>
+                    <p className="text-xs font-semibold" style={{ fontFamily: "var(--font-mono)", color: "var(--gris-fonce)" }}>{fmtNumero(c.numero)}</p>
                     <StatutBadge statut={c.statut} />
                   </div>
+                  <p className="font-semibold" style={{ fontFamily: "var(--font-display)", fontSize: "15px" }}>{modele?.nom || "Modèle"}</p>
                   <p className="text-xs mb-2" style={{ color: "var(--gris-fonce)" }}>{client ? `${client.prenom} ${client.nom}` : "Client"} · {c.genre || "—"} · Livraison {fmtDate(c.dateLivraison)}</p>
                   <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-xs mb-3" style={{ fontFamily: "var(--font-mono)" }}>
                     {toutesMesures.map((m) => (
                       <span key={m.key}>{m.label.replace(" (cm)", "")}: <strong>{c.mesures[m.key]}</strong> cm</span>
                     ))}
                   </div>
-                  {c.statut !== "Terminé" && (
-                    <Btn variant="or" className="w-full" style={{ padding: "6px 16px" }} onClick={() => avancerStatut(c.id)}>
-                      <Check size={14} /> {c.statut === "En attente" ? "Démarrer la couture" : "Marquer terminé"}
+                  {c.statut !== STATUT_FINAL && (
+                    <Btn variant="or" className="w-full" style={{ padding: "6px 16px" }} onClick={() => avancerStatut(c)}>
+                      <Check size={14} /> Passer à « {prochainStatut(c.statut)} »
                     </Btn>
                   )}
                   <Btn variant="ghost" className="w-full mt-2" style={{ padding: "6px 16px" }}
@@ -1662,17 +2234,17 @@ function Atelier({ commandes, setCommandes, catalogue, clients }) {
 
 /* ------------------------------- Paramètres -------------------------------- */
 
-function Parametres({ employes, setEmployes, onReset }) {
+function Parametres({ employes, ops, onReset }) {
   const [editing, setEditing] = useState(null);
 
   function save(e) {
-    if (e.id) setEmployes(employes.map((x) => (x.id === e.id ? e : x)));
-    else setEmployes([...employes, { ...e, id: uid() }]);
+    if (e.id) ops.update(e.id, e);
+    else ops.add({ ...e, id: uid() });
     setEditing(null);
     toastFdj("Employé enregistré ✓");
   }
   function remove(id) {
-    if (confirm("Retirer cet employé ?")) setEmployes(employes.filter((x) => x.id !== id));
+    if (confirm("Retirer cet employé ?")) ops.remove(id);
   }
 
   return (

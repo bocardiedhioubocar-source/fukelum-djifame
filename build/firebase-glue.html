@@ -1,0 +1,75 @@
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script>
+var firebaseConfig = {
+  apiKey: "AIzaSyAEOccNJF_yCXCtMC6gB3uzRbJjQhN7PDE",
+  authDomain: "fukelum-djifame.firebaseapp.com",
+  projectId: "fukelum-djifame",
+  storageBucket: "fukelum-djifame.firebasestorage.app",
+  messagingSenderId: "110631982096",
+  appId: "1:110631982096:web:05b9b1d0a78c135c55e695",
+};
+
+var COLLECTION = "fdj_data";
+
+try {
+  if (typeof firebase === "undefined") throw new Error("SDK Firebase non chargé (pas de réseau ?)");
+
+  firebase.initializeApp(firebaseConfig);
+  var db = firebase.firestore();
+  var auth = firebase.auth();
+  auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(function () {});
+
+  window.__fdjAuth = {
+    signIn: function (email, password) { return auth.signInWithEmailAndPassword(email, password); },
+    signUp: function (email, password) { return auth.createUserWithEmailAndPassword(email, password); },
+    signOut: function () { return auth.signOut(); },
+    onAuthStateChanged: function (cb) { return auth.onAuthStateChanged(cb); },
+  };
+
+  try { db.enablePersistence().catch(function () {}); } catch (e) {}
+
+  window.__fdjDb = db;
+  window.__fdjFirestore = firebase.firestore;
+
+  window.storage = {
+    get: function (key) {
+      return db.collection(COLLECTION).doc(key).get().then(function (snap) {
+        return snap.exists ? { key: key, value: snap.data().value, shared: true } : null;
+      });
+    },
+    set: function (key, value) {
+      return db.collection(COLLECTION).doc(key).set({ value: value, updatedAt: Date.now() }).then(function () {
+        return { key: key, value: value, shared: true };
+      });
+    },
+    delete: function (key) {
+      return db.collection(COLLECTION).doc(key).set({ value: null, updatedAt: Date.now() }).then(function () {
+        return { key: key, deleted: true, shared: true };
+      });
+    },
+    subscribe: function (key, callback) {
+      return db.collection(COLLECTION).doc(key).onSnapshot(
+        function (snap) {
+          window.__fdjCloudConnected = true;
+          callback(snap.exists ? snap.data().value : null);
+        },
+        function (err) {
+          console.error("Firestore — erreur de synchronisation :", err);
+          window.__fdjCloudConnected = false;
+        }
+      );
+    },
+  };
+} catch (e) {
+  console.error("Firestore — initialisation impossible, mode local dégradé :", e);
+  window.__fdjCloudConnected = false;
+  window.storage = window.__fdjFallbackStorage;
+}
+
+window.__startApp && window.__startApp();
+
+</script>
+</body>
+</html>
