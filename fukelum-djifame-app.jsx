@@ -109,12 +109,13 @@ function makeCollectionStore(name) {
   if (db) {
     const col = db.collection(name);
     return {
-      subscribe(cb) {
+      subscribe(cb, onError) {
         return col.onSnapshot(
           (snap) => cb(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
           (err) => {
             console.error(`Firestore(${name}) — erreur de synchronisation :`, err);
             window.__fdjCloudConnected = false;
+            if (onError) onError(err);
           }
         );
       },
@@ -479,8 +480,18 @@ export default function App() {
   }), []);
 
   useEffect(() => {
+    // On attend que l'état de connexion soit déterminé avant de toucher à
+    // Firestore : les règles de sécurité exigent un utilisateur connecté, donc
+    // tenter de lire les collections avant la connexion ne peut que renvoyer
+    // "permission-denied" (comportement normal et voulu). Ne rien charger
+    // dans ce cas et afficher directement l'écran de connexion, plutôt que de
+    // rester bloqué sur le chargement.
+    if (authUser === undefined) return;
+    if (!authUser) { setLoading(false); return; }
+
     let cancelled = false;
     let unsubs = [];
+    setLoading(true);
     const setters = {
       catalogue: setCatalogue, clients: setClients, stock: setStock,
       commandes: setCommandes, encaissements: setEncaissements, employes: setEmployes,
@@ -490,15 +501,21 @@ export default function App() {
       if (cancelled) return;
       const names = Object.keys(stores);
       let pending = names.length;
+      // Marque une collection comme traitée qu'elle ait réussi ou échoué sa
+      // synchronisation, pour ne jamais rester bloqué indéfiniment sur l'écran
+      // de chargement à cause d'une seule collection en erreur.
+      const marquerTraitee = () => {
+        if (pending > 0) { pending--; if (pending === 0 && !cancelled) setLoading(false); }
+      };
       unsubs = names.map((name) =>
-        stores[name].subscribe((items) => {
-          setters[name](items);
-          if (pending > 0) { pending--; if (pending === 0 && !cancelled) setLoading(false); }
-        })
+        stores[name].subscribe(
+          (items) => { setters[name](items); marquerTraitee(); },
+          () => marquerTraitee()
+        )
       );
     })();
     return () => { cancelled = true; unsubs.forEach((u) => u && u()); };
-  }, [stores]); // eslint-disable-line
+  }, [stores, authUser]); // eslint-disable-line
 
   async function reinitialiserDonneesDemo() {
     await Promise.all(commandes.map((c) => stores.commandes.remove(c.id)));
@@ -1229,6 +1246,37 @@ function ModeleForm({ model, onCancel, onSave }) {
 
 /* -------------------------------- Clients --------------------------------- */
 
+function ClientCard({ client: c, nbCommandes, onOpen, onEdit, onDelete }) {
+  const initiales = `${(c.prenom || "?")[0] || ""}${(c.nom || "?")[0] || ""}`.toUpperCase();
+  const aMesures = c.mesures && Object.values(c.mesures).some((v) => v);
+  return (
+    <Card className="overflow-hidden cursor-pointer" hover onClick={() => onOpen(c)}>
+      <div className="flex gap-3 p-3">
+        <div className="shrink-0 rounded-full flex items-center justify-center font-semibold" style={{ width: "44px", height: "44px", background: "var(--or-pale)", color: "#6b4e12" }}>
+          {initiales}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center justify-between gap-2">
+            <p className="font-medium truncate" style={{ fontSize: "14px" }}>{c.prenom} {c.nom}</p>
+            <Badge tone={c.genre === "Homme" ? "neutre" : "or"}>{c.genre || "—"}</Badge>
+          </div>
+          <p className="text-xs truncate" style={{ color: "var(--gris-fonce)" }}>{c.telephone || "—"}</p>
+        </div>
+      </div>
+      <div className="px-3 pb-2 flex items-center justify-between text-xs" style={{ color: "var(--gris-fonce)" }}>
+        <span className="flex items-center gap-1"><ShoppingBag size={12} /> {nbCommandes} commande{nbCommandes !== 1 ? "s" : ""}</span>
+        <span className="flex items-center gap-1">
+          <Ruler size={12} /> {aMesures ? "Mesures enregistrées" : "Pas de mesures"}
+        </span>
+      </div>
+      <div className="px-3 pb-3 flex justify-end gap-3" onClick={(e) => e.stopPropagation()}>
+        <button onClick={() => onEdit(c)}><Pencil size={13} style={{ color: "var(--gris-fonce)" }} /></button>
+        <button onClick={() => onDelete(c.id)}><Trash2 size={13} style={{ color: "var(--bordeaux)" }} /></button>
+      </div>
+    </Card>
+  );
+}
+
 function Clients({ clients, ops, commandes, catalogue }) {
   const [editing, setEditing] = useState(null);
   const [detail, setDetail] = useState(null);
@@ -1248,7 +1296,7 @@ function Clients({ clients, ops, commandes, catalogue }) {
 
   return (
     <div>
-      <Header title="Clients" sub="Fiche client, adresse complète et historique des commandes."
+      <Header title="Clients" sub="Fiche client, mesures de référence et historique des commandes."
         action={<Btn variant="or" onClick={() => setEditing({})}><Plus size={15} /> Nouveau client</Btn>} />
 
       <div className="mb-4 flex items-center gap-2 max-w-sm">
@@ -1256,62 +1304,185 @@ function Clients({ clients, ops, commandes, catalogue }) {
         <Input placeholder="Rechercher un client" value={q} onChange={(e) => setQ(e.target.value)} />
       </div>
 
-      <Card className="overflow-x-auto">
-        {filtered.length === 0 ? (
-          <EmptyState icon={Users} title="Aucun client" sub="Ajoutez votre premier client pour commencer une fiche mesures et un historique." />
-        ) : (
-          <table>
-            <thead><tr><th>Client</th><th>Genre</th><th>Téléphone</th><th>Ville / Adresse</th><th>Commandes</th><th></th></tr></thead>
-            <tbody>
-              {filtered.map((c) => (
-                <tr key={c.id} className="cursor-pointer" onClick={() => setDetail(c)}>
-                  <td className="font-medium">{c.prenom} {c.nom}</td>
-                  <td><Badge tone={c.genre === "Homme" ? "neutre" : "or"}>{c.genre || "—"}</Badge></td>
-                  <td>{c.telephone || "—"}</td>
-                  <td>{c.adresse || "—"}</td>
-                  <td>{commandes.filter((cmd) => cmd.clientId === c.id).length}</td>
-                  <td onClick={(e) => e.stopPropagation()}>
-                    <div className="flex gap-2">
-                      <button onClick={() => setEditing(c)}><Pencil size={13} style={{ color: "var(--gris-fonce)" }} /></button>
-                      <button onClick={() => remove(c.id)}><Trash2 size={13} style={{ color: "var(--bordeaux)" }} /></button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </Card>
+      {filtered.length === 0 ? (
+        <EmptyState icon={Users} title="Aucun client" sub="Ajoutez votre premier client pour commencer une fiche mesures et un historique." />
+      ) : (
+        <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(240px,1fr))" }}>
+          {filtered.map((c) => (
+            <ClientCard
+              key={c.id} client={c}
+              nbCommandes={commandes.filter((cmd) => cmd.clientId === c.id).length}
+              onOpen={setDetail} onEdit={setEditing} onDelete={remove}
+            />
+          ))}
+        </div>
+      )}
 
       {editing !== null && <ClientForm client={editing} onCancel={() => setEditing(null)} onSave={save} />}
       {detail && (
-        <Modal title={`${detail.prenom} ${detail.nom}`} onClose={() => setDetail(null)} wide>
-          <div className="grid sm:grid-cols-2 gap-4 mb-4 text-sm">
-            <p className="flex items-center gap-2"><Phone size={14} style={{ color: "var(--or)" }} /> {detail.telephone || "—"}</p>
-            <p className="flex items-center gap-2"><Mail size={14} style={{ color: "var(--or)" }} /> {detail.email || "—"}</p>
-            <p className="flex items-center gap-2 sm:col-span-2"><MapPin size={14} style={{ color: "var(--or)" }} /> {detail.adresse || "—"}</p>
-          </div>
-          <Ruban />
-          <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--gris-fonce)" }}>Historique des commandes</p>
-          {commandes.filter((c) => c.clientId === detail.id).length === 0 ? (
-            <p className="text-sm" style={{ color: "var(--gris-fonce)" }}>Aucune commande pour ce client pour le moment.</p>
-          ) : (
-            <div className="flex flex-col gap-2">
-              {commandes.filter((c) => c.clientId === detail.id).map((c) => {
-                const modele = catalogue.find((m) => m.id === c.modeleId);
-                return (
-                  <div key={c.id} className="flex items-center justify-between px-3 py-2 rounded-md" style={{ background: "var(--gris-clair)" }}>
-                    <span className="text-sm font-medium">{modele?.nom || "Modèle supprimé"}</span>
-                    <span className="text-xs" style={{ color: "var(--gris-fonce)" }}>{fmtDate(c.dateCreation)}</span>
-                    <StatutBadge statut={c.statut} />
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </Modal>
+        <FicheClient
+          client={clients.find((x) => x.id === detail.id) || detail}
+          commandes={commandes.filter((c) => c.clientId === detail.id)}
+          catalogue={catalogue}
+          ops={ops}
+          onClose={() => setDetail(null)}
+          onEdit={() => { setEditing(detail); setDetail(null); }}
+        />
       )}
     </div>
+  );
+}
+
+function FicheClient({ client, commandes, catalogue, ops, onClose, onEdit }) {
+  const [editMesures, setEditMesures] = useState(false);
+  const [voirMesuresId, setVoirMesuresId] = useState(null);
+  const liste = MESURES[client.genre] || MESURES.Femme;
+  const toutesMesures = [...liste.core, ...liste.extra].filter((m) => client.mesures?.[m.key]);
+  const historique = commandes.slice().sort((a, b) => (b.numero || 0) - (a.numero || 0));
+
+  function enregistrerMesures(mesures, genre) {
+    ops.update(client.id, { mesures, genre: genre || client.genre, mesuresMAJ: todayStr() });
+    setEditMesures(false);
+    toastFdj("Mesures de référence enregistrées ✓");
+  }
+
+  return (
+    <Modal title={`${client.prenom} ${client.nom}`} onClose={onClose} wide>
+      <div className="flex items-start justify-between gap-3 mb-4">
+        <div className="grid sm:grid-cols-2 gap-4 text-sm flex-1">
+          <p className="flex items-center gap-2"><Phone size={14} style={{ color: "var(--or)" }} /> {client.telephone || "—"}</p>
+          <p className="flex items-center gap-2"><Mail size={14} style={{ color: "var(--or)" }} /> {client.email || "—"}</p>
+          <p className="flex items-center gap-2 sm:col-span-2"><MapPin size={14} style={{ color: "var(--or)" }} /> {client.adresse || "—"}</p>
+        </div>
+        <button onClick={onEdit} title="Modifier la fiche client"><Pencil size={15} style={{ color: "var(--gris-fonce)" }} /></button>
+      </div>
+
+      <Ruban />
+
+      <div className="flex items-center justify-between mb-2">
+        <p className="text-xs uppercase tracking-wide font-semibold" style={{ color: "var(--or)" }}>
+          Mesures de référence ({client.genre || "Femme"})
+        </p>
+        <button className="text-xs font-semibold" style={{ color: "var(--or)" }} onClick={() => setEditMesures(true)}>
+          {toutesMesures.length ? "Modifier" : "+ Ajouter"}
+        </button>
+      </div>
+      {toutesMesures.length === 0 ? (
+        <p className="text-sm mb-3" style={{ color: "var(--gris-fonce)" }}>
+          Aucune mesure enregistrée pour ce client pour le moment.
+        </p>
+      ) : (
+        <>
+          <div className="grid sm:grid-cols-3 gap-x-3 gap-y-1 mb-1 text-sm">
+            {toutesMesures.map((m) => (
+              <p key={m.key} className="flex justify-between gap-2 pb-0.5" style={{ borderBottom: "1px dashed var(--ligne)" }}>
+                <span style={{ color: "var(--gris-fonce)" }}>{m.label.replace(" (cm)", "")}</span>
+                <span className="font-medium" style={{ fontFamily: "var(--font-mono)" }}>{client.mesures[m.key]}</span>
+              </p>
+            ))}
+          </div>
+          {client.mesuresMAJ && (
+            <p className="text-xs mb-3" style={{ color: "var(--gris-fonce)" }}>Mises à jour le {fmtDate(client.mesuresMAJ)}</p>
+          )}
+        </>
+      )}
+
+      <Ruban />
+
+      <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--gris-fonce)" }}>Historique des commandes</p>
+      {historique.length === 0 ? (
+        <p className="text-sm" style={{ color: "var(--gris-fonce)" }}>Aucune commande pour ce client pour le moment.</p>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {historique.map((c) => {
+            const modele = catalogue.find((m) => m.id === c.modeleId);
+            const listeC = MESURES[c.genre] || MESURES.Femme;
+            const mesuresC = [...listeC.core, ...listeC.extra].filter((m) => c.mesures?.[m.key]);
+            const ouvert = voirMesuresId === c.id;
+            return (
+              <div key={c.id} className="rounded-md" style={{ background: "var(--gris-clair)" }}>
+                <div
+                  className="flex items-center gap-2 px-3 py-2"
+                  style={{ cursor: mesuresC.length ? "pointer" : "default" }}
+                  onClick={() => mesuresC.length > 0 && setVoirMesuresId(ouvert ? null : c.id)}
+                >
+                  <span className="text-xs font-semibold shrink-0" style={{ fontFamily: "var(--font-mono)" }}>{fmtNumero(c.numero)}</span>
+                  <span className="text-sm font-medium truncate flex-1">{modele?.nom || "Modèle supprimé"}</span>
+                  <span className="text-xs shrink-0" style={{ color: "var(--gris-fonce)" }}>{fmtDate(c.dateCreation)}</span>
+                  <StatutBadge statut={c.statut} />
+                </div>
+                {ouvert && mesuresC.length > 0 && (
+                  <div className="grid sm:grid-cols-3 gap-x-3 gap-y-1 px-3 pb-2 text-xs">
+                    {mesuresC.map((m) => (
+                      <p key={m.key} className="flex justify-between gap-2">
+                        <span style={{ color: "var(--gris-fonce)" }}>{m.label.replace(" (cm)", "")}</span>
+                        <span className="font-medium" style={{ fontFamily: "var(--font-mono)" }}>{c.mesures[m.key]}</span>
+                      </p>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {editMesures && (
+        <MesuresClientForm client={client} onCancel={() => setEditMesures(false)} onSave={enregistrerMesures} />
+      )}
+    </Modal>
+  );
+}
+
+function MesuresClientForm({ client, onCancel, onSave }) {
+  const [genre, setGenre] = useState(client.genre || "Femme");
+  const [mesures, setMesures] = useState({ ...(client.mesures || {}) });
+  const [specifiquesOuvert, setSpecifiquesOuvert] = useState(false);
+  const fiches = MESURES[genre] || MESURES.Femme;
+
+  function changerGenre(g) {
+    if (g === genre) return;
+    if (Object.values(mesures).some((v) => v) && !confirm("Changer de genre réinitialise les mesures saisies ici. Continuer ?")) return;
+    setGenre(g);
+    setMesures({});
+  }
+
+  return (
+    <Modal title={`Mesures de référence — ${client.prenom} ${client.nom}`} onClose={onCancel} wide>
+      <Field label="Genre" hint="Détermine la fiche de mesures utilisée.">
+        <div className="flex gap-2">
+          {["Femme", "Homme"].map((g) => (
+            <button key={g} type="button" onClick={() => changerGenre(g)}
+              className="flex-1 rounded-md text-sm font-medium" style={{ padding: "8px 10px", border: "1px solid var(--ligne)", background: genre === g ? "var(--noir)" : "#fff", color: genre === g ? "var(--creme)" : "var(--noir)" }}>
+              {g}
+            </button>
+          ))}
+        </div>
+      </Field>
+      <div className="grid sm:grid-cols-2 gap-x-3">
+        {fiches.core.map((m) => (
+          <Field key={m.key} label={m.label}>
+            <Input type="number" value={mesures[m.key] || ""} onChange={(e) => setMesures({ ...mesures, [m.key]: e.target.value })} />
+          </Field>
+        ))}
+      </div>
+      <button className="text-xs font-semibold mb-2" style={{ color: "var(--or)" }} onClick={() => setSpecifiquesOuvert(!specifiquesOuvert)}>
+        {specifiquesOuvert ? "− Masquer" : "+ Ajouter"} les mesures complémentaires
+      </button>
+      {specifiquesOuvert && (
+        <div className="grid sm:grid-cols-2 gap-x-3 p-3 rounded-md mb-2" style={{ background: "var(--gris-clair)" }}>
+          {fiches.extra.map((m) => (
+            <Field key={m.key} label={m.label}>
+              <Input type="number" value={mesures[m.key] || ""} onChange={(e) => setMesures({ ...mesures, [m.key]: e.target.value })} />
+            </Field>
+          ))}
+        </div>
+      )}
+      <div className="flex justify-end gap-2 mt-4">
+        <Btn variant="ghost" onClick={onCancel}>Annuler</Btn>
+        <Btn variant="or" onClick={() => onSave(mesures, genre)}>Enregistrer les mesures</Btn>
+      </div>
+    </Modal>
   );
 }
 
@@ -1705,7 +1876,7 @@ function Commandes({ session, commandes, commandesOps, clients, clientsOps, cata
           modele={catalogue.find((x) => x.id === detail.modeleId)}
           tissu={stock.find((x) => x.id === detail.tissuId)}
           paiements={encaissements.filter((e) => e.commandeId === detail.id)}
-          commandesOps={commandesOps} isAdmin={isAdmin}
+          commandesOps={commandesOps} clientsOps={clientsOps} isAdmin={isAdmin}
           onClose={() => setDetail(null)}
         />
       )}
@@ -1732,7 +1903,7 @@ function EncaisserForm({ commande, onCancel, onConfirm }) {
    workflow de production, finances (historique des paiements) et notes.
    ------------------------------------------------------------------------ */
 
-function FicheCommande({ commande: c, client, modele, tissu, paiements, commandesOps, isAdmin, onClose }) {
+function FicheCommande({ commande: c, client, modele, tissu, paiements, commandesOps, clientsOps, isAdmin, onClose }) {
   const [pay, setPay] = useState(false);
   const [enCours, setEnCours] = useState(false);
   const [notes, setNotes] = useState(c.notes || "");
@@ -1740,6 +1911,14 @@ function FicheCommande({ commande: c, client, modele, tissu, paiements, commande
   const listeGenre = MESURES[c.genre] || MESURES.Femme;
   const mesuresRenseignees = [...listeGenre.core, ...listeGenre.extra].filter((m) => c.mesures?.[m.key]);
   const retard = estEnRetard(c);
+
+  function enregistrerMesuresSurFicheClient() {
+    if (!client) return;
+    const aDeja = client.mesures && Object.values(client.mesures).some((v) => v);
+    if (aDeja && !confirm(`Remplacer les mesures déjà enregistrées sur la fiche de ${client.prenom} par celles de cette commande ?`)) return;
+    clientsOps.update(client.id, { mesures: c.mesures, genre: c.genre, mesuresMAJ: todayStr() });
+    toastFdj("Mesures enregistrées sur la fiche client ✓");
+  }
   const idxStatut = STATUTS.indexOf(c.statut);
   const dernier = c.statut === STATUT_FINAL;
 
@@ -1809,7 +1988,14 @@ function FicheCommande({ commande: c, client, modele, tissu, paiements, commande
       <Ruban />
 
       {/* Mesures */}
-      <p className="text-xs uppercase tracking-wide font-semibold mb-2" style={{ color: "var(--or)" }}>Mesures</p>
+      <div className="flex items-center justify-between mb-2">
+        <p className="text-xs uppercase tracking-wide font-semibold" style={{ color: "var(--or)" }}>Mesures</p>
+        {client && mesuresRenseignees.length > 0 && (
+          <button className="text-xs font-semibold" style={{ color: "var(--or)" }} onClick={enregistrerMesuresSurFicheClient}>
+            Enregistrer sur la fiche client
+          </button>
+        )}
+      </div>
       {mesuresRenseignees.length === 0 ? (
         <p className="text-sm mb-1" style={{ color: "var(--gris-fonce)" }}>Aucune mesure enregistrée.</p>
       ) : (
@@ -1919,6 +2105,7 @@ function NouvelleCommandeForm({ onCancel, onSave, clients, clientsOps, catalogue
   const [genre, setGenre] = useState("");
   const [mesures, setMesures] = useState({});
   const [specifiquesOuvert, setSpecifiquesOuvert] = useState(false);
+  const [majFicheClient, setMajFicheClient] = useState(false);
   const [dateLivraison, setDateLivraison] = useState("");
   const [prixTotal, setPrixTotal] = useState("");
   const [avance, setAvance] = useState("");
@@ -1936,6 +2123,13 @@ function NouvelleCommandeForm({ onCancel, onSave, clients, clientsOps, catalogue
   const reste = Math.max(0, Number(prixTotal || 0) - Number(avance || 0));
   const depasseStock = tissu && Number(quantiteTissu) > Number(tissu.metrage);
   const fichesMesures = MESURES[genre] || MESURES.Femme;
+  const clientADesMesures = client?.mesures && Object.values(client.mesures).some((v) => v);
+
+  function reprendreMesuresClient() {
+    setGenre(client.genre || genre || "Femme");
+    setMesures({ ...(client.mesures || {}) });
+    toastFdj(`Mesures reprises de la fiche de ${client.prenom}`);
+  }
 
   const etape1Ok = !!clientId;
   const etape2Ok = !!(modeleId && tissuId && quantiteTissu && !depasseStock);
@@ -1963,6 +2157,9 @@ function NouvelleCommandeForm({ onCancel, onSave, clients, clientsOps, catalogue
         clientId, modeleId, tissuId, quantiteTissu: Number(quantiteTissu), genre, mesures, notes,
         dateLivraison, prixTotal: Number(prixTotal), avance: Number(avance || 0), resteAPayer: reste,
       });
+      if (majFicheClient && clientId) {
+        await clientsOps.update(clientId, { mesures, genre, mesuresMAJ: todayStr() });
+      }
     } catch (e) {
       setErreur(e.message || "Une erreur est survenue — la commande n'a pas été créée.");
       setEnregistrement(false);
@@ -2053,6 +2250,16 @@ function NouvelleCommandeForm({ onCancel, onSave, clients, clientsOps, catalogue
             </div>
           </Field>
 
+          {client && clientADesMesures && (
+            <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-md mb-3 flex-wrap" style={{ background: "var(--or-pale)" }}>
+              <span className="text-xs" style={{ color: "#6b4e12" }}>
+                Mesures enregistrées sur la fiche de {client.prenom}
+                {client.mesuresMAJ ? ` (mises à jour le ${fmtDate(client.mesuresMAJ)})` : ""}
+              </span>
+              <Btn variant="ghost" style={{ padding: "4px 10px" }} onClick={reprendreMesuresClient}>Reprendre ces mesures</Btn>
+            </div>
+          )}
+
           {genre && (
             <>
               <div className="grid sm:grid-cols-2 gap-x-3">
@@ -2073,6 +2280,12 @@ function NouvelleCommandeForm({ onCancel, onSave, clients, clientsOps, catalogue
                     </Field>
                   ))}
                 </div>
+              )}
+              {client && (
+                <label className="flex items-center gap-2 text-xs mt-1" style={{ color: "var(--gris-fonce)" }}>
+                  <input type="checkbox" checked={majFicheClient} onChange={(e) => setMajFicheClient(e.target.checked)} />
+                  Mettre à jour la fiche mesures de {client.prenom} avec ces valeurs
+                </label>
               )}
             </>
           )}
